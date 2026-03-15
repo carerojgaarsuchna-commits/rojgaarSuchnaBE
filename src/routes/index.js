@@ -1,0 +1,25 @@
+import express from "express";
+import homeRoutes from "./homeRoutes.js";
+import answerKeyRoutes from "./answerKeyRoutes.js";
+import documentRoutes from "./documentRoutes.js";
+import admitCardRoutes from "./admitCardRoutes.js";
+import resultRoutes from "./resultRoutes.js";
+import jobNotificationsValidatorRoutes from "./jobNotificationsValidatorRoutes.js";
+import admissionRoutes from "./admissionRoutes.js";
+import faqRoutes from "./faqRoutes.js";
+import departmentRoutes from "./departmentRoutes.js";
+import bodiesRoutes from "./bodiesRoutes.js";
+const router = express.Router();
+
+router.use("/home", homeRoutes);
+router.use("/answer-keys", answerKeyRoutes);
+router.use("/documents", documentRoutes);
+router.use("/admit-cards", admitCardRoutes);
+router.get("/results", resultRoutes);
+router.use("/job-notifications", jobNotificationsValidatorRoutes);
+router.use("/admissions", admissionRoutes);
+router.use("/faqs", faqRoutes);
+router.use("/department", departmentRoutes);    
+router.use("/bodies", bodiesRoutes);
+
+export default router;
