@@ -1,11 +1,12 @@
 import express from "express";
-import { getLatestJobs, getLatestJobBySlug, createLatestJob, updateLatestJob, deleteLatestJob } from "../controllers/latestJobController.js";
+import { getLatestJobs, getLatestJobBySlug, createLatestJob, updateLatestJob, deleteLatestJob, getAIGeneratedLatestJob } from "../controllers/latestJobController.js";
 import { parseFormFields, validateLatestJob } from "../middleware/validateLatestJob.js";
 import { upload } from "../utils/multerConfig.js";
 import { handleMulterError } from "../middleware/handleMulterError.js";
 const router = express.Router();
 
 router.get("/list", getLatestJobs);
+router.get("/ai-jobs", getAIGeneratedLatestJob);
 router.get("/:slug", getLatestJobBySlug);
 router.post(
   "/",
@@ -29,7 +30,7 @@ router.post(
 );
 
 router.put(
-  "/",
+  "/:slug",
   (req, res, next) => {
     upload.single("notificationPdf")(req, res, (err) => {
       if (err) return handleMulterError(err, req, res, next);
@@ -48,6 +49,6 @@ router.put(
   validateLatestJob,
   updateLatestJob
 );
-router.delete("/:id", deleteLatestJob);
+router.delete("/:slug", deleteLatestJob);
 
 export default router;

@@ -32,7 +32,7 @@ export const getHomeData = async (req, res, next) => {
 
           const selectFields =
             modelName === "LatestJob"
-              ? "title slug type category"
+              ? "title slug type category isAIGenerated"
               : "name logo title slug";
 
           const data = await Model.findById(item.refId)
@@ -65,7 +65,7 @@ export const getHomeData = async (req, res, next) => {
         return section;
       })
     );
-
+console.log('isAIGenerated', JSON.stringify(home.sections));
     return res.json({
       success: true,
       data: home,

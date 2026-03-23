@@ -62,6 +62,10 @@ const LatestJobSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    blogTxt: {
+      type: String,
+      trim: true,
+    },
     shortDescription: {
       type: String,
       maxlength: 300,
@@ -109,6 +113,10 @@ const LatestJobSchema = new mongoose.Schema(
     },
     publishedAt: { type: Date, default: Date.now },
     expiresAt: { type: Date }, // Auto-set to lastDate + 30 days
+     isAIGenerated: {
+      type: Boolean,
+      default: false
+      },
   },
   { timestamps: true }
 );

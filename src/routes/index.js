@@ -9,6 +9,7 @@ import admissionRoutes from "./admissionRoutes.js";
 import faqRoutes from "./faqRoutes.js";
 import departmentRoutes from "./departmentRoutes.js";
 import bodiesRoutes from "./bodiesRoutes.js";
+import promptByAi from "./promptByAi.js"
 const router = express.Router();
 
 router.use("/home", homeRoutes);
@@ -21,5 +22,5 @@ router.use("/admissions", admissionRoutes);
 router.use("/faqs", faqRoutes);
 router.use("/department", departmentRoutes);    
 router.use("/bodies", bodiesRoutes);
-
+router.use('/promptbyai', promptByAi)
 export default router;

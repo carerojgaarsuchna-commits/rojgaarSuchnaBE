@@ -20,3 +20,10 @@ export const checkImageExists = async (url) => {
     return false;
   }
 };
+
+
+export function extractMarkdownTitle(content) {
+  if (!content) return undefined;
+  const match = content.match(/^\s*#\s+(.+?)\s*$/m);
+  return match?.[1]?.trim();
+}

@@ -1,11 +1,10 @@
 import { z } from "zod";
+
 const dateYYYYMMDD = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be YYYY-MM-DD")
-  .refine(
-    (v) => !isNaN(Date.parse(v)),
-    "Invalid date"
-  );
+  .refine((v) => !isNaN(Date.parse(v)), "Invalid date");
+
 export const jobNotificationsSchema = z.object({
   title: z
     .string()
@@ -30,13 +29,11 @@ export const jobNotificationsSchema = z.object({
     "scheme",
     "scholarship",
     "notice",
-    "admissions"
+    "admissions",
   ]),
 
-  // totalPosts is required → convert string → number
   totalPosts: z.preprocess(
     (val) => {
-      // Optional field → allow empty
       if (val === undefined || val === null || val === "") {
         return undefined;
       }
@@ -54,41 +51,37 @@ export const jobNotificationsSchema = z.object({
   postName: z
     .string()
     .optional()
-    .transform(val => (val?.trim() ? val : undefined)),
+    .transform((val) => (val?.trim() ? val : undefined)),
 
-  applyLink: z
-    .string()
-    .url("Invalid applyLink URL"),
+  applyLink: z.string().url("Invalid applyLink URL"),
 
-  officialWebsite: z
-    .string()
-    .url("Invalid officialWebsite URL"),
+  officialWebsite: z.string().url("Invalid officialWebsite URL"),
 
   // lastDate: dateYYYYMMDD,
+  content: z.string().min(50, "Content too short"),
 
-  content: z
-    .string()
-    .min(50, "Content too short"),
-
-  // Tags required → form-data comes as: "tag1,tag2"
   tags: z.preprocess(
     (val) => {
+      if (val === undefined || val === null || val === "") {
+        return undefined;
+      }
+
       if (Array.isArray(val)) return val;
+
       return String(val)
         .split(",")
         .map((t) => t.trim())
         .filter(Boolean);
     },
-    z.array(z.string()).min(1, "At least one tag is required")
+    z.array(z.string()).optional()
   ),
-  importantDates: z
-    .preprocess((val) => {
-      // If field is missing or empty string → treat as undefined
+
+  importantDates: z.preprocess(
+    (val) => {
       if (val === undefined || val === null || val === "") {
         return undefined;
       }
 
-      // If coming as JSON string → parse it
       if (typeof val === "string") {
         try {
           return JSON.parse(val);
@@ -99,23 +92,22 @@ export const jobNotificationsSchema = z.object({
 
       return val;
     },
-      z.array(
+    z
+      .array(
         z.object({
           label: z.string(),
           date: z.string(),
         })
-      ).optional()
-    ),
+      )
+      .optional()
+  ),
 
-  // ageLimit required → JSON required
   ageLimit: z.preprocess(
     (val) => {
-      // If field is missing or empty → treat as undefined
       if (val === undefined || val === null || val === "") {
         return undefined;
       }
 
-      // If coming as JSON string (FormData case)
       if (typeof val === "string") {
         try {
           return JSON.parse(val);
@@ -135,7 +127,7 @@ export const jobNotificationsSchema = z.object({
       })
       .optional()
   ),
-  //status only one at a time
+
   status: z.enum(["active", "draft", "expired"]),
   isFeatured: z.boolean().optional(),
   views: z.string().optional(),
@@ -143,4 +135,3 @@ export const jobNotificationsSchema = z.object({
   shares: z.string().optional(),
   notificationPdf: z.string().min(1, "PDF path required"),
 });
-

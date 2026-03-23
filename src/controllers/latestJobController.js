@@ -1,7 +1,10 @@
 // server/controllers/latestJobController.js
+import { success } from "zod";
 import { LatestJob } from "../models/LatestJob.js";
 import { seedHome } from "../seeders/homeSeeder.js";
+import { createAIBlog } from "../service/latestJobsService.js";
 import { upload } from "../utils/multerConfig.js";
+import { extractMarkdownTitle } from "../utils/helper.js";
 
 const triggerHomeSeed = () => {
   seedHome().catch((error) => {
@@ -145,22 +148,27 @@ export const createLatestJob = async (req, res, next) => {
 // PUT: Update Job
 export const updateLatestJob = async (req, res, next) => {
   try {
-    const { id } = req.body;
-    if (!id) {
+    const { slug } = req.params;
+    console.log("[updateLatestJob] params.slug:", slug);
+
+    if (!slug) {
       return res.status(400).json({
         success: false,
-        message: "Job ID is required for update",
+        message: "Job slug is required for update",
       });
     }
+
     if (!req.validatedData) {
       return res.status(400).json({
         success: false,
         message: "No data to update",
       });
     }
-    const data = req.validatedData;
 
-    const job = await LatestJob.findByIdAndUpdate(id, data, { new: true });
+    const data = req.validatedData;
+    console.log("[updateLatestJob] validated data:", data);
+
+    const job = await LatestJob.findOneAndUpdate({ slug }, data, { new: true });
     if (!job) {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
@@ -170,7 +178,9 @@ export const updateLatestJob = async (req, res, next) => {
       .populate("department", "name logo")
       .populate("body", "name");
 
-    res.status(201).json({
+    triggerHomeSeed();
+
+    res.status(200).json({
       success: true,
       data: populated,
     });
@@ -185,7 +195,7 @@ export const deleteLatestJob = async (req, res, next) => {
   try {
     const { slug } = req.params;
 
-    const job = await LatestJob.findByIdAndDelete({ slug: slug });
+    const job = await LatestJob.findOneAndDelete({ slug });
     if (!job) {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
@@ -196,3 +206,96 @@ export const deleteLatestJob = async (req, res, next) => {
     next(err);
   }
 };
+
+// post
+export const promptAILatestJob = async (req, res, next) => {
+  try {
+    let data = req.validatedData;
+
+    // console.log('data----', data);
+
+    const generatedBlog = await createAIBlog(data.blogTxt)
+    const aiTitle = extractMarkdownTitle(generatedBlog);
+
+    if (!generatedBlog) {
+      return res.status(400).json({ success: false, message: "Unable to generate blog by ai" });
+    }
+
+    data = {
+      ...data,
+      content: generatedBlog,
+      isAIGenerated: true,
+      ...(aiTitle ? { title: aiTitle } : {}),
+    }
+
+    const job = new LatestJob(data);
+    const savedJob =     await job.save();
+
+    res.status(201).json({ success: true, slug:savedJob.slug, message: "Ai successfully generated the post",AIBlog:savedJob.content })
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+    next(err);
+  }
+}
+
+export const getAIGeneratedLatestJob = async (req, res, next) => {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      type,
+      category,
+      body,
+      department,
+      search,
+      status = "draft",
+      isAIGenerated = true
+    } = req.query;
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    // Build filter
+    let filter = { status, isAIGenerated };
+    if (type) filter.type = type;
+    if (category) filter.category = category;
+    if (department) filter.department = department;
+    if (body) filter.body = body;
+    if (search) {
+      filter = {
+        $or: [
+          { title: { $regex: search, $options: 'i' } },
+          { slug: { $regex: search, $options: 'i' } },
+        ],
+      }
+    }
+
+    // Count total
+    const total = await LatestJob.countDocuments(filter);
+
+    // Fetch with population
+    const jobs = await LatestJob.find(filter)
+      .populate("department", "name logo")
+      .populate("body", "name logo")
+      .sort({ publishedAt: -1 })
+      .skip(skip)
+      .limit(limitNum);
+  const titleByAI = jobs.content.split('\n')[0];
+    console.log('---generatedBlog', titleByAI)
+    res.json({
+      success: true,
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(total / limitNum),
+        totalJobs: total,
+        hasNext: pageNum < Math.ceil(total / limitNum),
+        hasPrev: pageNum > 1,
+      },
+      data: jobs,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+    next(err);
+  }
+}

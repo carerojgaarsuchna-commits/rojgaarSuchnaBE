@@ -8,7 +8,8 @@
     "start": "node src/server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "seed": "node src/seeders/index.js",
-    "replace-domain": "node src/scripts/replaceDomain.js"
+    "replace-domain": "node src/scripts/replaceDomain.js",
+    "testAIAPI": "node src/service/latestJobsService.js"
   },
   "keywords": [],
   "author": "",
