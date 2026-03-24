@@ -126,6 +126,9 @@ LatestJobSchema.index({ department: 1, body: 1 });
 LatestJobSchema.index({ category: 1, type: 1 });
 LatestJobSchema.index({ "importantDates.timestamp": 1 });
 LatestJobSchema.index({ tags: 1 });
+LatestJobSchema.index({ status: 1, publishedAt: -1, _id: -1 });
+LatestJobSchema.index({ status: 1, type: 1, publishedAt: -1, _id: -1 });
+LatestJobSchema.index({ isAIGenerated: 1, status: 1, publishedAt: -1, _id: -1 });
 LatestJobSchema.index({ title: "text", shortDescription: "text", content: "text" });
 
 // === MIDDLEWARE: Auto-generate slug, short desc, timestamps ===

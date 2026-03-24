@@ -26,8 +26,8 @@ export const getLatestJobs = async (req, res, next) => {
       status = "active",
     } = req.query;
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.max(parseInt(limit, 10) || 10, 1);
     const skip = (pageNum - 1) * limitNum;
 
     // Build filter
@@ -38,11 +38,12 @@ export const getLatestJobs = async (req, res, next) => {
     if (body) filter.body = body;
     if (search) {
       filter = {
+        ...filter,
         $or: [
-          { title: { $regex: search, $options: 'i' } },
-          { slug: { $regex: search, $options: 'i' } },
+          { title: { $regex: search, $options: "i" } },
+          { slug: { $regex: search, $options: "i" } },
         ],
-      }
+      };
     }
 
     // Count total
@@ -50,9 +51,11 @@ export const getLatestJobs = async (req, res, next) => {
 
     // Fetch with population
     const jobs = await LatestJob.find(filter)
-      .populate("department", "name logo")
-      .populate("body", "name logo")
-      .sort({ publishedAt: -1 })
+      .select(
+        "_id title slug applyLink officialWebsite notificationPdf type isFeatured status publishedAt createdAt updatedAt __v isAIGenerated"
+      )
+      .sort({ publishedAt: -1, _id: -1 })
+      .setOptions({ allowDiskUse: true })
       .skip(skip)
       .limit(limitNum);
 
@@ -252,8 +255,8 @@ export const getAIGeneratedLatestJob = async (req, res, next) => {
       isAIGenerated = true
     } = req.query;
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.max(parseInt(limit, 10) || 10, 1);
     const skip = (pageNum - 1) * limitNum;
 
     // Build filter
@@ -264,11 +267,12 @@ export const getAIGeneratedLatestJob = async (req, res, next) => {
     if (body) filter.body = body;
     if (search) {
       filter = {
+        ...filter,
         $or: [
-          { title: { $regex: search, $options: 'i' } },
-          { slug: { $regex: search, $options: 'i' } },
+          { title: { $regex: search, $options: "i" } },
+          { slug: { $regex: search, $options: "i" } },
         ],
-      }
+      };
     }
 
     // Count total
@@ -278,7 +282,8 @@ export const getAIGeneratedLatestJob = async (req, res, next) => {
     const jobs = await LatestJob.find(filter)
       .populate("department", "name logo")
       .populate("body", "name logo")
-      .sort({ publishedAt: -1 })
+      .sort({ publishedAt: -1, _id: -1 })
+      .setOptions({ allowDiskUse: true })
       .skip(skip)
       .limit(limitNum);
   const titleByAI = jobs.content.split('\n')[0];
