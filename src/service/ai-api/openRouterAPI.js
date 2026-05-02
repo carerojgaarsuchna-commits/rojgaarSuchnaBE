@@ -9,14 +9,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export async function openRouterAPI(prompt) {
-    console.log('--------prompt------------ai------')
-    console.log(prompt)
-    console.log('--------prompt------------ai------')
+    const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+
+    if (!apiKey) {
+        throw new Error("OPENROUTER_API_KEY is not configured");
+    }
+
     const apiUrl = "https://openrouter.ai/api/v1/chat/completions";
     const model = process.env.OPENROUTER_MODEL || "stepfun/step-3.5-flash:free";
 
     const headers = {
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json"
     };
 
@@ -53,7 +56,5 @@ export async function openRouterAPI(prompt) {
     if (!response.ok) {
         throw new Error(result?.error?.message || "OpenRouter error");
     }
-    console.log('result?.choices?.[0]?.message?', result?.choices?.[0]?.message)
-    console.log('-result', result?.choices?.[0]?.message?.content);
     return result?.choices?.[0]?.message?.content;
 }
