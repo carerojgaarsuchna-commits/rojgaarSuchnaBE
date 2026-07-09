@@ -152,7 +152,7 @@ export const createLatestJob = async (req, res, next) => {
 export const updateLatestJob = async (req, res, next) => {
   try {
     const { slug } = req.params;
-    console.log("[updateLatestJob] params.slug:", slug);
+  
 
     if (!slug) {
       return res.status(400).json({
@@ -169,7 +169,7 @@ export const updateLatestJob = async (req, res, next) => {
     }
 
     const data = req.validatedData;
-    console.log("[updateLatestJob] validated data:", data);
+  
 
     const job = await LatestJob.findOneAndUpdate({ slug }, data, { new: true });
     if (!job) {
