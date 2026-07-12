@@ -1,8 +1,9 @@
 import webhookQueue from "../queues/webhook.queue.js"
 const receiveChange = async (req, res) => {
     try {
-        console.log('req.body',req.body)
-
+    console.log("Content-Type:", req.headers["content-type"]);
+    console.log("Body:", req.body);
+    console.log("Raw Body:", req.body);
 
         await webhookQueue.add(
             "process-webhook",
