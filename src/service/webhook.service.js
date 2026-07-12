@@ -5,15 +5,11 @@ function buildPrompt(payload) {
     const {
         watch_uuid,
         watch_title,
-        watch_url,
-        watch_tag,
-        preview_url,
-        diff_url,
+        watch_url,        
         change_datetime,
         diff,
         diff_added,
         diff_removed,
-        current_snapshot,
         triggered_text
     } = payload;
 
