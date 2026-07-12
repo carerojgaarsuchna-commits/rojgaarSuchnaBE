@@ -16,7 +16,7 @@ export async function openRouterAPI(prompt) {
     }
 
     const apiUrl = "https://openrouter.ai/api/v1/chat/completions";
-    const model = process.env.OPENROUTER_MODEL || "stepfun/step-3.5-flash:free";
+    const model = process.env.OPENROUTER_MODEL || "";
 
     const headers = {
         Authorization: `Bearer ${apiKey}`,
@@ -24,14 +24,16 @@ export async function openRouterAPI(prompt) {
     };
 
     const systemPrompt = `
-        You are an expert SEO content writer for an Indian government job portal.
-        Write structured markdown content using:
-        ### headings
-        tables
-        bullet lists
-        numbered lists
-        Use clear formatting and short paragraphs.
-`;
+    You are the structured information extraction engine for Rojgaar Suchna.
+
+    Extract recruitment-related information from official Indian government website changes.
+
+    Always:
+    - return valid JSON only;
+    - follow the user's schema exactly;
+    - never hallucinate or invent facts;
+    - preserve official wording whenever possible.
+    `;
 
     const response = await fetch(apiUrl, {
         method: "POST",
@@ -54,6 +56,7 @@ export async function openRouterAPI(prompt) {
     const result = await response.json();
 
     if (!response.ok) {
+        console.error('Ai Error ',result?.error?.message);
         throw new Error(result?.error?.message || "OpenRouter error");
     }
     return result?.choices?.[0]?.message?.content;

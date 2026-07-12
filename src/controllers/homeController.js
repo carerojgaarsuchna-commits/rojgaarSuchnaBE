@@ -65,7 +65,7 @@ export const getHomeData = async (req, res, next) => {
         return section;
       })
     );
-console.log('isAIGenerated', JSON.stringify(home.sections));
+// console.log('isAIGenerated', JSON.stringify(home.sections));
     return res.json({
       success: true,
       data: home,

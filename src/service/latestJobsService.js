@@ -75,7 +75,7 @@ export async function createAIBlog(blogTxt) {
     try {
         if (!blogTxt?.trim() || !AIPROMPT.trim()) {
 
-            console.log('no blog data found');
+            console.error('no blog data found');
             return
         }
         const AIPromptWithBlogTxt = AIPROMPT + " " + blogTxt

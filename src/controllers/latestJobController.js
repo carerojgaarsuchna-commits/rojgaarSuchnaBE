@@ -287,7 +287,7 @@ export const getAIGeneratedLatestJob = async (req, res, next) => {
       .skip(skip)
       .limit(limitNum);
   const titleByAI = jobs.content.split('\n')[0];
-    console.log('---generatedBlog', titleByAI)
+    // console.log('---generatedBlog', titleByAI)
     res.json({
       success: true,
       pagination: {
