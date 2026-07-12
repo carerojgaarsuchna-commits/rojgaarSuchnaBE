@@ -5,7 +5,7 @@ import webhookController from '../controllers/webhook.controller.js'
 const router = express.Router()
 
 router.post('/change',
-verifyWebhook,
+// verifyWebhook,
 webhookController.receiveChange
 )
 
