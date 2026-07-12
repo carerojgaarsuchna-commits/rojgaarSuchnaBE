@@ -1,13 +1,17 @@
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
-// import { errorHandler } from "./middlewares/errorHandler.js";
 import router from "./routes/index.js";
 
 const app = express();
 
-// Middleware
+// Log request size BEFORE body parsing
+app.use((req, res, next) => {
+    console.log("Content-Length:", req.headers["content-length"]);
+    next();
+});
 
+// Parse request body
 app.use(express.json({
     limit: "5mb"
 }));
@@ -23,8 +27,5 @@ if (process.env.NODE_ENV === "development") app.use(morgan("dev"));
 
 // Routes
 app.use("/api", router);
-
-// Error Handling
-// app.use(errorHandler);
 
 export default app;
