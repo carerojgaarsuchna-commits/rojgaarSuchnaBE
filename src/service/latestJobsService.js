@@ -73,16 +73,17 @@ Input Article: [PASTE_FULL_ARTICLE_HERE]
 `
 export async function createAIBlog(blogTxt) {
     try {
-        if (!blogTxt.trim() || !AIPROMPT.trim()) {
+        if (!blogTxt?.trim() || !AIPROMPT.trim()) {
 
-            console.log('no blog data found');
+            console.error('no blog data found');
             return
         }
         const AIPromptWithBlogTxt = AIPROMPT + " " + blogTxt
         const aiAPIResponse = await openRouterAPI(AIPromptWithBlogTxt);
         return aiAPIResponse
     } catch (err) {
-        throw new Error(err)
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`AI blog generation failed: ${message}`);
 
     }
 

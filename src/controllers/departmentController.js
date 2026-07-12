@@ -63,7 +63,7 @@ export const getDepartments = async (req, res, next) => {
 export const getDepartmentById = async (req, res, next) => {
   try {
     const { slug } = req.params;
-    console.log("Fetching department with ID:", slug);
+    // console.log("Fetching department with ID:", slug);
 
     if (!slug) {
       return res.status(400).json({
@@ -98,7 +98,7 @@ export const createDepartment = async (req, res, next) => {
   try {
     const body = req.body || {};
 
-    console.log("Received department data:", body);
+    // console.log("Received department data:", body);
     if (!body.name) {
       return res.status(400).json({
         success: false,

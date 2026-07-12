@@ -157,7 +157,7 @@ export const createBody = async (req, res, next) => {
   try {
     const body = req.body || {};
 
-    console.log("Received body data:", body);
+    // console.log("Received body data:", body);
     if (!body.name) {
       return res.status(400).json({
         success: false,
