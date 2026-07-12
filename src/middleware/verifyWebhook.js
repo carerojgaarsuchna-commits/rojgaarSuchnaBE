@@ -1,8 +1,26 @@
-function isValidChangeDetection (payload){
-    const diff = String(payload.diff || "");
-    const snapshot = String(payload.current_snapshot || "");
+function parseWebhook(body) {
+    if (body.secret) {
+        return body;
+    }
 
-    const text = `${diff} ${snapshot}`.toLowerCase();
+    if (!body.message) {
+        throw new Error("Missing webhook message");
+    }
+
+    let msg = body.message;
+
+    // remove HTML entities
+    msg = msg.replace(/&nbsp;/g, "");
+    msg = msg.replace(/<[^>]*>/g, "");
+
+    // convert \u0026
+    msg = msg.replace(/\\u0026/g, "&");
+
+    return JSON.parse(msg);
+}
+
+function isValidChangeDetection(payload) {
+    const diff = String(payload.diff || "");
 
     // 1. Empty diff
     if (!diff.trim()) {
@@ -20,36 +38,6 @@ function isValidChangeDetection (payload){
         };
     }
 
-    // 3. Ignore common useless changes
-    const ignoreWords = [
-        "total visits",
-        "visitor count",
-        "support id",
-        "ip address",
-        "host name",
-        "screen reader",
-        "skip to main content",
-        "font size",
-        "color contrast",
-        "accessibility",
-        "captcha",
-        "human visitor",
-        "audio is not supported"
-    ];
-
-    for (const word of ignoreWords) {
-
-        if (text.includes(word)) {
-
-            return {
-                valid: false,
-                reason: `"${word}" detected`
-            };
-
-        }
-
-    }
-
     // Passed all checks
     return {
         valid: true
@@ -58,10 +46,11 @@ function isValidChangeDetection (payload){
 };
 
 
-
 const verifyWebhook = (req, res, next) => {
 
     try {
+        req.body = parseWebhook(req.body);
+
         const secret = req.body.secret;
 
         if (!secret) {
