@@ -35,28 +35,58 @@ function buildPrompt(payload) {
     Detected At:
     ${change_datetime}
 
-    Newly Added Content (Primary Source):
+    PRIMARY INPUT (Extract notifications ONLY from this):
     ${diff_added}
 
-    Removed Content (Reference Only):
+    REFERENCE INPUT (Never extract new notifications from this):
     ${diff_removed}
 
-    Full Diff (Use ONLY if diff_added is empty):
+    FALLBACK INPUT (Use ONLY when PRIMARY INPUT is empty):
     ${diff}
 
-    ==================================================
+   ==================================================
     GENERAL RULES
     ==================================================
 
-    - Use diff_added as the primary source of truth.
-    - Use diff only if diff_added is empty.
-    - Use diff_removed only to determine whether an existing notification was updated.
-    - Never invent, complete, or assume missing information.
-    - The Website Name and Website URL are authoritative. Use them directly whenever possible.
-    - Strip HTML, CSS, JavaScript fragments and formatting artifacts mentally before analysis.
-    - Return ONLY valid JSON.
-    - Do NOT return markdown.
-    - Do NOT explain your reasoning outside the JSON.
+    Source Priority (STRICT)
+
+    1. Extract notifications ONLY from diff_added.
+    2. If diff_added is empty, extract from diff.
+    3. Never create a notification solely from diff_removed.
+    4. diff_removed exists ONLY to determine whether a notification is Updated.
+    5. If a notification appears only in diff_removed, ignore it completely.
+    6. Never combine information from diff_added and diff_removed into a new notification.
+    7. Never invent, complete, or assume missing information.
+    8. Website Name and Website URL are authoritative.
+    9. Strip HTML, CSS, JavaScript, visitor counters and formatting artifacts before analysis.
+    10. Return ONLY valid JSON.
+    11. Do NOT return markdown.
+    12. Do NOT explain anything outside the JSON.
+
+    ==================================================
+    CHANGE INTERPRETATION RULES
+    ==================================================
+
+    Interpret the inputs exactly as follows:
+
+    diff_added
+    -------------
+    Contains content that has appeared on the website.
+    Only this content may produce NEW notifications.
+
+    diff_removed
+    -------------
+    Contains content that disappeared from the website.
+    This content MUST NOT produce new notifications.
+
+    A notification found ONLY in diff_removed means it was removed from the page.
+    Ignore it unless it clearly represents an updated version of the SAME notification found in diff_added.
+
+    diff
+    -------------
+    Contains both added and removed content.
+    Use it ONLY when diff_added is empty.
+    Never extract from diff if diff_added contains recruitment information.
 
     ==================================================
     STEP 1 — RELEVANCE CHECK
@@ -182,6 +212,24 @@ function buildPrompt(payload) {
 
     If uncertain whether two pieces represent different notifications, prefer separate items.
 
+    Never create an item for content that appears only in diff_removed.
+
+    Example
+
+    diff_added:
+    + CEN 05/2025 Answer Key
+
+    diff_removed:
+    + CEN 09/2025 Application Status
+    + CEN 04/2025 Document Verification
+
+    Correct Output:
+    1 item
+
+    CEN 05/2025
+
+    Incorrect Output:
+    3 items
     ==================================================
     FIELD RULES
     ==================================================
@@ -326,27 +374,39 @@ function buildPrompt(payload) {
 
     new_or_updated
 
-    Return:
+    Return "New" when the notification originates from diff_added.
 
-    New
+    Return "Updated" ONLY if BOTH of the following are true:
 
-    or
+    1. The same notification exists in diff_added.
+    2. A previous version of that SAME notification exists in diff_removed.
 
-    Updated
+    Examples of Updated:
 
-    Return Updated ONLY when diff_removed clearly shows the SAME notification being revised.
+    Old:
+    Result published on 10 July
 
-    Examples:
+    New:
+    Result revised on 12 July
 
-    Updated exam date
+    Old:
+    Admit Card Notice
 
-    Updated result
+    New:
+    Revised Admit Card Notice
 
-    Corrected PDF
+    Examples of NOT Updated:
 
-    Changed instructions
+    diff_added:
+    CEN 05/2025
 
-    Otherwise return New.
+    diff_removed:
+    CEN 09/2025
+
+    Result:
+    CEN 05/2025 = New
+
+    Ignore CEN 09/2025 completely.
 
     ----------------------------------
 
@@ -395,6 +455,15 @@ function buildPrompt(payload) {
     - Never discard a valid notification because another one appears more important.
     - Preserve official titles whenever possible.
     - Return ONLY valid JSON.
+    ==================================================
+    MOST IMPORTANT RULE
+    ==================================================
+
+    A notification MUST originate from diff_added.
+
+    If a notification is not present in diff_added, it MUST NOT appear in the output.
+
+    The only exception is when diff_added is empty, in which case use diff.
     `
 }
 
