@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { ALLOWED_NOTIFICATION_CATEGORIES } from "../utils/notificationCategory.js";
 
 const LatestNotificationSchema = new mongoose.Schema(
   {
@@ -46,17 +47,7 @@ const LatestNotificationSchema = new mongoose.Schema(
 
     category: {
       type: String,
-      enum: [
-        "Job Vacancy",
-        "Result",
-        "Admit Card",
-        "Answer Key",
-        "Admission",
-        "Syllabus",
-        "Notice",
-        "Tender",
-        "Other",
-      ],
+      enum: ALLOWED_NOTIFICATION_CATEGORIES,
       required: true,
       index: true,
     },

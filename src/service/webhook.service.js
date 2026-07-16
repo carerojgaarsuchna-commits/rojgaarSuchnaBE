@@ -1,18 +1,21 @@
 import { openRouterAPI } from "./ai-api/openRouterAPI.js";
 import crypto from "crypto";
-import { LatestNotification } from "../models/LatestNotification.js"
+import { LatestNotification } from "../models/LatestNotification.js";
+import {
+    normalizeNotificationCategory,
+} from "../utils/notificationCategory.js";
 function buildPrompt(payload) {
     const {
         watch_uuid,
         watch_title,
-        watch_url,        
+        watch_url,
         change_datetime,
         diff,
         diff_added,
         diff_removed,
         triggered_text
     } = payload;
-
+    console.log('diff_added----',diff_added);
     return `
 
     You are the content extraction engine for "Rojgaar Suchna", a platform that monitors official Indian government websites for recruitment, examination, admission, and other candidate-related notifications.
@@ -96,6 +99,7 @@ function buildPrompt(payload) {
 
     Relevant examples include:
 
+    - Job
     - Job Vacancy
     - Recruitment Advertisement
     - Result
@@ -116,6 +120,7 @@ function buildPrompt(payload) {
     - City Intimation
     - Call Letter
     - Corrigendum
+    - Scholarship
     - Tender
 
     Ignore completely if the change is only:
@@ -316,19 +321,26 @@ function buildPrompt(payload) {
 
     Must be EXACTLY one of:
 
-    Job Vacancy
+    Job
     Result
     Admit Card
     Answer Key
-    Admission
     Syllabus
+    Admission
     Notice
+    Scholarship
     Tender
-    Other
 
-    Choose the most specific option.
+    Never create any other category name.
 
-    Do not overuse "Notice".
+    Use these deterministic mappings:
+
+    - recruitment and vacancy advertisements = Job
+    - merit list, shortlist, cut off, selected candidate, supplementary result, and application status = Result
+    - generic notices, corrigendum, OTR, and exam calendar = Notice
+    - scholarship announcements = Scholarship
+
+    Labels such as Merit List, Shortlist, Cut Off, Application Status, Corrigendum, and Recruitment Advertisement must appear only in notification_type, not in category.
 
     ----------------------------------
 
@@ -454,6 +466,8 @@ function buildPrompt(payload) {
     - Never merge unrelated notifications.
     - Never discard a valid notification because another one appears more important.
     - Preserve official titles whenever possible.
+    - Category must be exactly one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender.
+    - Never create new category names.
     - Return ONLY valid JSON.
     ==================================================
     MOST IMPORTANT RULE
@@ -475,6 +489,25 @@ function generateHash(item, watch_uuid) {
         )
         .digest("hex");
 }
+
+function normalizeNotificationItem(item) {
+    const normalizedCategory = normalizeNotificationCategory(
+        item.category,
+        item.notification_type,
+        item.title,
+    );
+
+    const explanationSuffix = item.category === normalizedCategory
+        ? ""
+        : ` Category normalized from "${item.category || "missing"}" to "${normalizedCategory}".`;
+
+    return {
+        ...item,
+        category: normalizedCategory,
+        raw_explanation: `${item.raw_explanation || ""}${explanationSuffix}`.trim(),
+    };
+}
+
 export const processJob = async (payload) => {
     try {
         const prompt = buildPrompt(payload);
@@ -490,43 +523,44 @@ export const processJob = async (payload) => {
         }
 
         for (const item of data.items) {
+            const normalizedItem = normalizeNotificationItem(item);
 
-            const dedupeHash = generateHash(item, data.watch_uuid);
+            const dedupeHash = generateHash(normalizedItem, data.watch_uuid);
 
             const existing = await LatestNotification.findOne({
                 dedupe_hash: dedupeHash
             });
 
             if (existing) {
-                console.log("Duplicate notification:", item.title);
+                console.log("Duplicate notification:", normalizedItem.title);
                 continue;
             }
 
             await LatestNotification.create({
                 watch_uuid: data.watch_uuid,
 
-                title: item.title,
-                summary: item.summary,
+                title: normalizedItem.title,
+                summary: normalizedItem.summary,
 
-                source_url: item.source_url,
+                source_url: normalizedItem.source_url,
 
-                department: item.department,
-                body: item.body,
+                department: normalizedItem.department,
+                body: normalizedItem.body,
 
-                category: item.category,
-                notification_type: item.notification_type,
+                category: normalizedItem.category,
+                notification_type: normalizedItem.notification_type,
 
-                notification_date: item.notification_date,
+                notification_date: normalizedItem.notification_date,
 
-                new_or_updated: item.new_or_updated,
+                new_or_updated: normalizedItem.new_or_updated,
 
                 publish: data.publish ?? true,
 
                 dedupe_hash: dedupeHash,
 
                 ai: {
-                    confidence: item.confidence,
-                    explanation: item.raw_explanation,
+                    confidence: normalizedItem.confidence,
+                    explanation: normalizedItem.raw_explanation,
                     model: process.env.OPENROUTER_MODEL,
                 },
 
@@ -535,7 +569,7 @@ export const processJob = async (payload) => {
                 ai_response: data,
             });
 
-            console.log("Saved:", item.title);
+            console.log("Saved:", normalizedItem.title);
         }
 
         return true;
@@ -548,3 +582,7 @@ export const processJob = async (payload) => {
         throw new Error(`AI processing failed: ${message}`);
     }
 };
+
+// export const processFailedJobs = async (payload) => {
+
+// }
