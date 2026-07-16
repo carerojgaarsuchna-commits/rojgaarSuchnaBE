@@ -1,9 +1,16 @@
+import "dotenv/config";
 import IORedis from "ioredis";
 
+const redisHost = process.env.REDIS_HOST;
+const redisPort = Number(process.env.REDIS_PORT || 6379);
+
+if (!redisHost) {
+    throw new Error("REDIS_HOST is not configured");
+}
 
 const connection = new IORedis({
-    host: process.env.REDIS_HOST,
-    port: process.env.REDIS_PORT,
+    host: redisHost,
+    port: redisPort,
     username: "default",
     password: process.env.REDIS_KEY,
     maxRetriesPerRequest: null,
