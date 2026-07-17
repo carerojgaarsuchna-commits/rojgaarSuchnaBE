@@ -8,5 +8,6 @@ router.post('/change',
 verifyWebhook,
 webhookController.receiveChange
 )
+router.get('/list',webhookController.getLetestNotifications)
 
 export default router;
