@@ -7,7 +7,6 @@ const LatestNotificationSchema = new mongoose.Schema(
     watch_uuid: {
       type: String,
       required: true,
-      index: true,
     },
 
     source_url: {
@@ -49,7 +48,6 @@ const LatestNotificationSchema = new mongoose.Schema(
       type: String,
       enum: ALLOWED_NOTIFICATION_CATEGORIES,
       required: true,
-      index: true,
     },
 
     notification_type: {
@@ -60,7 +58,6 @@ const LatestNotificationSchema = new mongoose.Schema(
 
     notification_date: {
       type: Date,
-      index: true,
     },
 
     notification_date_raw: {
@@ -78,7 +75,6 @@ const LatestNotificationSchema = new mongoose.Schema(
     publish: {
       type: Boolean,
       default: true,
-      index: true,
     },
 
     status: {
@@ -90,14 +86,12 @@ const LatestNotificationSchema = new mongoose.Schema(
         "duplicate",
       ],
       default: "pending_review",
-      index: true,
     },
 
     // Deduplication
     dedupe_hash: {
       type: String,
       required: true,
-      index: true,
     },
 
     // AI Metadata
@@ -140,9 +134,42 @@ const LatestNotificationSchema = new mongoose.Schema(
 );
 
 // Useful Indexes
-LatestNotificationSchema.index({ watch_uuid: 1, createdAt: -1 });
-LatestNotificationSchema.index({ category: 1, notification_date: -1 });
-LatestNotificationSchema.index({ status: 1, publish: 1 });
-LatestNotificationSchema.index({ body: 1, notification_date: -1 });
+LatestNotificationSchema.index({ dedupe_hash: 1 }, { unique: true });
+
+LatestNotificationSchema.index({
+    watch_uuid: 1,
+    createdAt: -1,
+});
+
+LatestNotificationSchema.index({
+    status: 1,
+    publish: 1,
+    notification_date: -1,
+});
+
+LatestNotificationSchema.index({
+    category: 1,
+    notification_date: -1,
+});
+
+LatestNotificationSchema.index({
+    body: 1,
+    notification_date: -1,
+});
+
+LatestNotificationSchema.index({
+    department: 1,
+    notification_date: -1,
+});
+
+LatestNotificationSchema.index({
+    createdAt: -1,
+});
+
+LatestNotificationSchema.index({
+    title: "text",
+    summary: "text",
+    department: "text",
+});
 
 export const LatestNotification = mongoose.model("LatestNotification", LatestNotificationSchema);
