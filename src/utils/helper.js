@@ -29,7 +29,7 @@ export function extractMarkdownTitle(content) {
 }
 
 export function buildSlug(item) {
-    return (item.notification_key || item.title || "")
+    return (item.title || "")
         .toLowerCase()
         .replace(/[^a-z0-9\s&()-]/g, "")
         .replace(/\s+&\s+/g, " and ")

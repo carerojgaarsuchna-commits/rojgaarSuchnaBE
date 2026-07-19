@@ -173,7 +173,6 @@ export const getLetestNotificationBySlug = async (req, res, next) => {
                 ...job,
                 ai_response: {
                     items: job.ai_response?.items?.map(item => ({
-                        notification_key: item.notification_key,
                         title: item.title,
                         summary: item.summary,
                         category: item.category,
