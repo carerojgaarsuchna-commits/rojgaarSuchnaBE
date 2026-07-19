@@ -9,5 +9,6 @@ verifyWebhook,
 webhookController.receiveChange
 )
 router.get('/list',webhookController.getLetestNotifications)
+router.get('/:slug',webhookController.getLetestNotificationBySlug)
 
 export default router;
