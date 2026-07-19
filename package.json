@@ -12,7 +12,8 @@
     "replace-domain": "node src/scripts/replaceDomain.js",
     "testAIAPI": "node src/service/latestJobsService.js",
     "processFailedQueue": "node src/scripts/processFailedQueue.js",
-    "normalizeNotificationCategories": "node src/scripts/normalizeLatestNotificationCategories.js"
+    "normalizeNotificationCategories": "node src/scripts/normalizeLatestNotificationCategories.js",
+    "generateSlug":"node src/scripts/generateSlug.js"
   },
   "keywords": [],
   "author": "",
