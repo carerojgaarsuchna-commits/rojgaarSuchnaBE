@@ -178,7 +178,6 @@ function buildPrompt(payload) {
     "watch_uuid": "{{watch_uuid}}",
     "items": [
         {
-        "notification_key": "",
         "title": "",
         "summary": "",
         "source_url": "",
@@ -239,69 +238,81 @@ function buildPrompt(payload) {
     ==================================================
     FIELD RULES
     ==================================================
-
-    notification_key
-
-    Generate a short, stable, and SEO-friendly identifier using only information that is explicitly available in the notification.
-
-    Rules:
-    - Use lowercase letters only.
-    - Separate words with hyphens (-).
-    - Include official identifiers when available (e.g. CEN, advertisement number, notification number, year).
-    - Keep the identifier concise while remaining descriptive.
-    - Use only factual information present in the source.
-    - Never invent reference numbers, dates, departments, or keywords.
-    - The same notification should always generate the same notification_key.
-
-    Good Examples:
-    - rrb-ranchi-cen-02-2025-dv-call-letter
-    - ssc-gd-result-2026
-    - upsc-cds-2-2026-notification
-    - bpsc-assistant-engineer-admit-card-2026
-
-    Bad Examples:
-    - latest-railway-job
-    - govt-job-update
-    - notification-123
-    - rrb-2026-exam (if "exam" is not mentioned)
-
-    --------------------------------------------------
-
     title
 
-    Preserve the official notification title exactly as published whenever possible.
+    Generate a human-friendly, SEO-friendly title that accurately describes the notification.
+
+    Purpose:
+    - This is the primary title shown to users.
+    - This title will also be used to generate the page slug.
+    - It should match how people naturally search on Google.
+    - Prefer readability over copying the official title word-for-word.
 
     Rules:
-    - Keep the original wording.
-    - Preserve:
-    - CEN numbers
-    - Advertisement numbers
-    - Notification numbers
-    - Recruitment numbers
-    - Stage names
-    - Official abbreviations
-    - Department names
-    - Only normalize obvious formatting issues such as:
-    - Extra spaces
-    - Inconsistent capitalization
-    - Accidental line breaks
-    - Do not summarize.
-    - Do not simplify.
-    - Do not add missing words.
-    - Do not remove official information.
-    - Never rewrite the title in your own words.
+    - Preserve all important identifying information.
+    - Keep official identifiers whenever they uniquely identify the notification (CEN, Advertisement No., Notification No., Recruitment No., etc.).
+    - Include the organization or recruiting body when available.
+    - Include the examination, recruitment, post, scheme, or subject.
+    - Include the notification type (Notification, Recruitment, Result, Admit Card, Answer Key, Merit List, Syllabus, Vacancy, etc.).
+    - Include the year when explicitly available.
+    - Reorder words to improve readability.
+    - Remove redundant legal or administrative wording that does not help identify the notification.
+    - Remove phrases such as:
+    - Regarding...
+    - In reference to...
+    - Notice for...
+    - Result of...
+    - Held on...
+    - Dated...
+    - Computer Based Test
+    - Preliminary Examination
+    - Main Examination
+    - Written Examination
+    - Phase-I
+    - Stage-I
+    - Stage-II
+    - Subject to...
+    when they do not help users identify the notification.
+    - Never invent departments, posts, years, numbers, stages, or keywords.
+    - Never change official reference numbers.
+    - Keep the title concise (typically 40–80 characters).
+    - Write in Title Case.
+    - The same notification should always generate the same title.
 
-    Good Example:
+    Examples
+
+    Official:
+    Result of Stage-I Preliminary Examination (Computer Based Test) of Junior Judicial Assistant / Restorer (Open) Examination – 2026
+
+    Output:
+    Delhi High Court Junior Judicial Assistant Result 2026
+
     Official:
     CEN No. 02/2025 (NTPC) - Call Letter for Document Verification
 
     Output:
-    CEN No. 02/2025 (NTPC) - Call Letter for Document Verification
+    RRB NTPC CEN 02/2025 Document Verification Call Letter
 
-    Bad Example:
-    Railway NTPC DV Admit Card Released
+    Official:
+    Notice regarding release of SSC GD Constable Examination Result 2026
 
-    --------------------------------------------------
+    Output:
+    SSC GD Constable Result 2026
+
+    Official:
+    Advertisement No. 05/2026 Recruitment of Assistant Engineer (Civil)
+
+    Output:
+    Assistant Engineer (Civil) Recruitment Advertisement No. 05/2026
+
+    Bad Examples:
+    - Latest Government Job
+    - New Notification
+    - Click Here
+    - Download PDF
+    - Important Notice
+    - Notification Regarding...
+----------------------------------
     summary
 
     Write 2–3 simple sentences describing:
