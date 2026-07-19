@@ -36,7 +36,6 @@ const LatestNotificationSchema = new mongoose.Schema(
     slug: {
       type: String,
       trim: true,
-      index: true,
     },
 
     summary: {
@@ -121,7 +120,7 @@ const LatestNotificationSchema = new mongoose.Schema(
     webhook_payload: {
       type: mongoose.Schema.Types.Mixed,
     },
-
+    views: { type: Number, default: 0 },
     // Optional: full AI response
     ai_response: {
       type: mongoose.Schema.Types.Mixed,

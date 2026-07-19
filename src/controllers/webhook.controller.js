@@ -1,5 +1,6 @@
 import webhookQueue from "../queues/webhook.queue.js"
 import { LatestNotification } from "../models/LatestNotification.js"
+import { latestJobsAIPromptSchema } from "../validators/latestJobsAIPromptValidator.js";
 const receiveChange = async (req, res) => {
     try {
         await webhookQueue.add(
@@ -143,8 +144,55 @@ const getLetestNotifications = async (req, res, next) => {
     }
 };
 
+export const getLetestNotificationBySlug = async (req, res, next) => {
+    try {
+        const { slug } = req.params;
 
+        const job = await LatestNotification.findOne({ slug }).select(
+            "title slug summary category notification_type notification_date department body source_url views ai_response createdAt updatedAt"
+        ).lean();;
+
+        if (!job) {
+            return res.status(404).json({
+                success: false,
+                message: "Notification not found",
+            });
+        }
+
+        // increment views
+        await LatestNotification.updateOne(
+            { slug },
+            { $inc: { views: 1 } }
+        );
+
+        job.views += 1;
+
+        res.json({
+            success: true,
+            data: {
+                ...job,
+                ai_response: {
+                    items: job.ai_response?.items?.map(item => ({
+                        notification_key: item.notification_key,
+                        title: item.title,
+                        summary: item.summary,
+                        category: item.category,
+                        notification_type: item.notification_type,
+                        notification_date: item.notification_date,
+                        source_url: item.source_url,
+                        department: item.department,
+                        body: item.body,
+                        new_or_updated: item.new_or_updated,
+                    })) || [],
+                },
+            },
+        });
+    } catch (err) {
+        next(err);
+    }
+};
 export default {
     receiveChange,
-    getLetestNotifications
+    getLetestNotifications,
+    getLetestNotificationBySlug
 }
