@@ -4,6 +4,7 @@ import { LatestNotification } from "../models/LatestNotification.js";
 import {
     normalizeNotificationCategory,
 } from "../utils/notificationCategory.js";
+import { buildSlug,generateUniqueSlug } from "../utils/helper.js"
 function buildPrompt(payload) {
     const {
         watch_uuid,
@@ -15,7 +16,7 @@ function buildPrompt(payload) {
         diff_removed,
         triggered_text
     } = payload;
-    console.log('diff_added----',diff_added);
+    console.log('diff_added----', diff_added);
     return `
 
     You are the content extraction engine for "Rojgaar Suchna", a platform that monitors official Indian government websites for recruitment, examination, admission, and other candidate-related notifications.
@@ -241,39 +242,66 @@ function buildPrompt(payload) {
 
     notification_key
 
-    Generate a short stable identifier using available information.
+    Generate a short, stable, and SEO-friendly identifier using only information that is explicitly available in the notification.
 
-    Example:
+    Rules:
+    - Use lowercase letters only.
+    - Separate words with hyphens (-).
+    - Include official identifiers when available (e.g. CEN, advertisement number, notification number, year).
+    - Keep the identifier concise while remaining descriptive.
+    - Use only factual information present in the source.
+    - Never invent reference numbers, dates, departments, or keywords.
+    - The same notification should always generate the same notification_key.
 
-    rrb-ranchi-cen-02-2025-dv-call-letter
+    Good Examples:
+    - rrb-ranchi-cen-02-2025-dv-call-letter
+    - ssc-gd-result-2026
+    - upsc-cds-2-2026-notification
+    - bpsc-assistant-engineer-admit-card-2026
 
-    or
+    Bad Examples:
+    - latest-railway-job
+    - govt-job-update
+    - notification-123
+    - rrb-2026-exam (if "exam" is not mentioned)
 
-    ssc-gd-result-2026
-
-    Use lowercase words separated by hyphens.
-
-    Do not invent reference numbers.
-
-    ----------------------------------
+    --------------------------------------------------
 
     title
 
-    Preserve the official notification title as closely as possible.
+    Preserve the official notification title exactly as published whenever possible.
 
-    Keep:
-
+    Rules:
+    - Keep the original wording.
+    - Preserve:
     - CEN numbers
     - Advertisement numbers
+    - Notification numbers
     - Recruitment numbers
-    - Official wording
+    - Stage names
+    - Official abbreviations
+    - Department names
+    - Only normalize obvious formatting issues such as:
+    - Extra spaces
+    - Inconsistent capitalization
+    - Accidental line breaks
+    - Do not summarize.
+    - Do not simplify.
+    - Do not add missing words.
+    - Do not remove official information.
+    - Never rewrite the title in your own words.
 
-    Only normalize obvious spacing or capitalization.
+    Good Example:
+    Official:
+    CEN No. 02/2025 (NTPC) - Call Letter for Document Verification
 
-    Never rewrite the official title into your own wording.
+    Output:
+    CEN No. 02/2025 (NTPC) - Call Letter for Document Verification
 
-    ----------------------------------
+    Bad Example:
+    Railway NTPC DV Admit Card Released
 
+    --------------------------------------------------
     summary
 
     Write 2–3 simple sentences describing:
@@ -511,9 +539,7 @@ function normalizeNotificationItem(item) {
 export const processJob = async (payload) => {
     try {
         const prompt = buildPrompt(payload);
-
         const aiResponse = await openRouterAPI(prompt);
-
         // aiResponse is a string
         const data = JSON.parse(aiResponse);
 
@@ -526,6 +552,8 @@ export const processJob = async (payload) => {
             const normalizedItem = normalizeNotificationItem(item);
 
             const dedupeHash = generateHash(normalizedItem, data.watch_uuid);
+            const baseSlug = buildSlug(normalizedItem);
+            const slug = await generateUniqueSlug(baseSlug, LatestNotification);
 
             const existing = await LatestNotification.findOne({
                 dedupe_hash: dedupeHash
@@ -535,54 +563,35 @@ export const processJob = async (payload) => {
                 console.log("Duplicate notification:", normalizedItem.title);
                 continue;
             }
-
             await LatestNotification.create({
                 watch_uuid: data.watch_uuid,
-
                 title: normalizedItem.title,
+                slug,
                 summary: normalizedItem.summary,
-
                 source_url: normalizedItem.source_url,
-
                 department: normalizedItem.department,
                 body: normalizedItem.body,
-
                 category: normalizedItem.category,
                 notification_type: normalizedItem.notification_type,
-
                 notification_date: normalizedItem.notification_date,
-
                 new_or_updated: normalizedItem.new_or_updated,
-
                 publish: data.publish ?? true,
-
                 dedupe_hash: dedupeHash,
-
                 ai: {
                     confidence: normalizedItem.confidence,
                     explanation: normalizedItem.raw_explanation,
                     model: process.env.OPENROUTER_MODEL,
                 },
-
                 webhook_payload: payload,
-
                 ai_response: data,
             });
-
-            console.log("Saved:", normalizedItem.title);
+           console.log("Saved:", normalizedItem.title);
         }
-
         return true;
-
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-
         console.error(message);
-
         throw new Error(`AI processing failed: ${message}`);
     }
 };
 
-// export const processFailedJobs = async (payload) => {
-
-// }

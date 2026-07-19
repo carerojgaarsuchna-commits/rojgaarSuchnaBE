@@ -135,7 +135,10 @@ const LatestNotificationSchema = new mongoose.Schema(
 
 // Useful Indexes
 LatestNotificationSchema.index({ dedupe_hash: 1 }, { unique: true });
-
+LatestNotificationSchema.index(
+    { slug: 1 },
+    // { unique: true }
+);
 LatestNotificationSchema.index({
     watch_uuid: 1,
     createdAt: -1,

@@ -100,6 +100,7 @@ const getLetestNotifications = async (req, res, next) => {
             LatestNotification.find(filter)
                 .select({
                     title: 1,
+                    slug: 1,
                     summary: 1,
                     body: 1,
                     department: 1,
