@@ -1,14 +1,15 @@
 import express from 'express'
-import verifyWebhook  from '../middleware/verifyWebhook.js'
+import verifyWebhook from '../middleware/verifyWebhook.js'
 import webhookController from '../controllers/webhook.controller.js'
 
 const router = express.Router()
 
 router.post('/change',
-verifyWebhook,
-webhookController.receiveChange
+    verifyWebhook,
+    webhookController.receiveChange
 )
-router.get('/list',webhookController.getLetestNotifications)
-router.get('/:slug',webhookController.getLetestNotificationBySlug)
+router.get('/list', webhookController.getLetestNotifications)
+router.get('/sitemap', webhookController.letestNotificationSitemap)
+router.get('/:slug', webhookController.getLetestNotificationBySlug)
 
 export default router;
