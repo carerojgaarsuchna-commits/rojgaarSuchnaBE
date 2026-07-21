@@ -190,8 +190,53 @@ export const getLetestNotificationBySlug = async (req, res, next) => {
         next(err);
     }
 };
+const letestNotificationSitemap = async (req, res, next) => {
+    try {
+        console.log('0---')
+        const page = Math.max(Number(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
+
+        const skip = (page - 1) * limit;
+
+        const filter = {
+            // publish: true,
+        };
+
+        const [data, totalRecords] = await Promise.all([
+            LatestNotification.find(filter)
+                .select({
+                    slug: 1,
+                    updatedAt: 1,
+                })
+                .sort({
+                    _id: 1,
+                })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
+
+            LatestNotification.countDocuments(filter),
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            pagination: {
+                currentPage: page,
+                limit,
+                totalRecords,
+                totalPages: Math.ceil(totalRecords / limit),
+                hasNext: page * limit < totalRecords,
+                hasPrevious: page > 1,
+            },
+            data,
+        });
+    } catch (error) {
+        next(error);
+    }
+};
 export default {
     receiveChange,
     getLetestNotifications,
-    getLetestNotificationBySlug
+    getLetestNotificationBySlug,
+    letestNotificationSitemap
 }

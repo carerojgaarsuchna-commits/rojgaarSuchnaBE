@@ -3,144 +3,117 @@ import mongoose from "mongoose";
 import { connectDB } from "../config/db.js";
 
 import { LatestNotification } from "../models/LatestNotification.js";
-import { buildSlug, generateUniqueSlug } from "../utils/helper.js"
+import { generateUniqueSlug } from "../utils/helper.js"
+import { openRouterAPI } from "../service/ai-api/openRouterAPI.js";
 
-export function buildSeoSlug(title, maxLength = 60, maxWords = 8) {
-    if (!title) return "";
-
-    const stopWords = new Set([
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "for",
-        "to",
-        "of",
-        "on",
-        "in",
-        "at",
-        "by",
-        "with",
-        "from",
-        "into",
-        "regarding",
-        "regard",
-        "link",
-        "view",
-        "download",
-        "click",
-        "here",
-        "candidate",
-        "candidates",
-        "various",
-        "latest",
-        "official",
-        "notification",
-    ]);
-
-    // Replace long/common phrases with SEO-friendly versions
-    const replacements = [
-        [/computer based test/gi, "cbt"],
-        [/computer based examination/gi, "cbt"],
-        [/computer based exam/gi, "cbt"],
-        [/descriptive examination/gi, "descriptive-exam"],
-        [/objective examination/gi, "objective-exam"],
-        [/assistant loco pilot/gi, "alp"],
-        [/junior judicial assistant/gi, "jja"],
-        [/multi tasking staff/gi, "mts"],
-        [/combined graduate level/gi, "cgl"],
-        [/combined higher secondary level/gi, "chsl"],
-        [/stage ii/gi, "stage-2"],
-        [/stage iii/gi, "stage-3"],
-        [/stage iv/gi, "stage-4"],
-        [/tentative schedule/gi, "schedule"],
-        [/answer key/gi, "answer-key"],
-        [/admit card/gi, "admit-card"],
-        [/apply online/gi, "apply-online"],
-        [/result declared/gi, "result"],
-        [/score card/gi, "scorecard"],
-        [/score card/gi, "scorecard"],
-        [/qp\/html/gi, "response"],
-    ];
-
-    let text = title;
-
-    for (const [regex, replacement] of replacements) {
-        text = text.replace(regex, replacement);
-    }
-
-    const words = text
+export function buildSlug(item) {
+    return (item || "")
         .toLowerCase()
-        .replace(/&/g, " and ")
-        .replace(/\//g, " ")
-        .replace(/[()]/g, " ")
-        .replace(/[^a-z0-9\s-]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .split(" ")
-        .filter((word) => word && !stopWords.has(word))
-        .slice(0, maxWords);
-
-    let slug = "";
-
-    for (const word of words) {
-        const next = slug ? `${slug}-${word}` : word;
-
-        if (next.length > maxLength) break;
-
-        slug = next;
-    }
-
-    return slug
+        .replace(/[^a-z0-9\s&()-]/g, "")
+        .replace(/\s+&\s+/g, " and ")
+        .replace(/[\s()+]+/g, "-")
         .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "");
+        .replace(/(^-|-$)/g, "");
 }
+function buildPrompt(title, summary, department) {
+    return `
+You are an expert at writing SEO-friendly titles for Indian government notifications.
 
+Task:
+Rewrite the official notification title into a human-friendly, search-friendly title.
 
-async function migrateSlugs() {
+Rules:
+- Return ONLY the final title.
+- Do not use quotes.
+- Do not use markdown.
+- Do not explain your reasoning.
+- Do not invent any information.
+- Preserve official identifiers such as CEN, Advertisement No., Notification No., Recruitment No., etc.
+- Keep the organization, post, notification type, and year whenever available.
+- Remove unnecessary official wording.
+- Make the title natural and easy to read.
+- Keep it under 80 characters whenever possible.
+- Write in Title Case.
+
+Official Title:
+${title}
+
+Summary (context only):
+${summary || "N/A"}
+
+Department (context only):
+${department || "N/A"}
+
+{
+title
+}
+`;
+
+}
+async function migrateTitlesAndSlugs() {
     await connectDB();
 
     const notifications = await LatestNotification.find({
-        $or: [
-            { slug: { $exists: false } },
-            { slug: null },
-            { slug: "" },
-        ],
+        title: { $exists: true, $ne: "" },
     });
 
-    console.log(`Found ${notifications.length} documents without slug.`);
+    console.log(`Found ${notifications.length} notifications`);
 
     let updated = 0;
 
     for (const notification of notifications) {
-        console.log('---notification--', notification.title)
+        try {
+            console.log(`\nProcessing: ${notification.title}`, notification.summary);
 
-        const baseSlug = buildSeoSlug(notification.title);
-        if (!baseSlug) {
-            console.log(`Skipping ${notification._id} (empty title)`);
-            continue;
+            const prompt = buildPrompt(notification.title, notification.summary, notification.department);
+
+            let aiTitle = await openRouterAPI(prompt);
+            console.log('aiTitle-----', aiTitle)
+            // const data = JSON.parse(aiTitle);
+            // console.log('---data', data)
+
+            aiTitle = aiTitle
+                ?.trim()
+                .replace(/^["']|["']$/g, "");
+
+            if (!aiTitle) {
+                console.log("AI returned empty title. Skipping.");
+                continue;
+            }
+
+            const baseSlug = buildSlug(aiTitle);
+
+            if (!baseSlug) {
+                console.log("Unable to generate slug. Skipping.");
+                continue;
+            }
+            console.log('baseSlug--', baseSlug);
+            const slug = await generateUniqueSlug(
+                baseSlug,
+                LatestNotification,
+            );
+
+            notification.title = aiTitle;
+            notification.slug = slug;
+
+            await notification.save();
+
+            updated++;
+
+            console.log(`✓ ${aiTitle}`);
+            console.log(`✓ ${slug}`);
+        } catch (err) {
+            console.error(
+                `Failed for ${notification._id}:`,
+                err.message
+            );
         }
-        const slug = await generateUniqueSlug(
-            baseSlug,
-            LatestNotification,
-            notification._id
-        );
-
-        notification.slug = slug;
-        await notification.save();
-
-        updated++;
-
-        console.log(`${updated}. ${slug}`);
     }
 
-    console.log(`Done. Updated ${updated} documents.`);
-
-    await mongoose.disconnect();
+    console.log(`\nDone. Updated ${updated} notifications.`);
 }
 
-migrateSlugs().catch((err) => {
+migrateTitlesAndSlugs().catch((err) => {
     console.error(err);
     process.exit(1);
 }).finally(async () => {
