@@ -206,6 +206,7 @@ const letestNotificationSitemap = async (req, res, next) => {
             LatestNotification.find(filter)
                 .select({
                     slug: 1,
+                    category: 1,
                     updatedAt: 1,
                 })
                 .sort({
