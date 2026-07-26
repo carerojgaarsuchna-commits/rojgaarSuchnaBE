@@ -4,7 +4,7 @@ import { LatestNotification } from "../models/LatestNotification.js";
 import {
     normalizeNotificationCategory,
 } from "../utils/notificationCategory.js";
-import { buildSlug,generateUniqueSlug } from "../utils/helper.js"
+import { buildSlug, generateUniqueSlug, isValidAIResponse } from "../utils/helper.js"
 function buildPrompt(payload) {
     const {
         watch_uuid,
@@ -179,6 +179,7 @@ function buildPrompt(payload) {
     "items": [
         {
         "title": "",
+        "original_title": "",
         "summary": "",
         "source_url": "",
         "department": "",
@@ -383,6 +384,34 @@ function buildPrompt(payload) {
 
     ----------------------------------
 
+    original_title
+
+    Store the official title exactly as it appears on the source website.
+
+    Purpose:
+
+    Preserve the original wording published by the authority.
+    This is used for verification and source reference.
+    Users can search this exact text on the official page (Ctrl+F) and find the notification.
+    Do NOT rewrite, shorten, or optimize it.
+    Preserve capitalization, punctuation, reference numbers, abbreviations, stages, and examination names exactly.
+    Never translate.
+    Never remove words.
+    Never add words.
+    Never normalize spacing except trimming leading/trailing whitespace.
+    If multiple headings exist, use the primary notification heading.
+
+    Example
+
+    Official Page
+
+    Result of Stage-I Preliminary Examination (Computer Based Test) of Junior Judicial Assistant / Restorer (Open) Examination – 2026
+
+    Output
+
+    Result of Stage-I Preliminary Examination (Computer Based Test) of Junior Judicial Assistant / Restorer (Open) Examination – 2026
+    ----------------------------------
+
     notification_type
 
     Choose the most appropriate value.
@@ -425,12 +454,24 @@ function buildPrompt(payload) {
 
     new_or_updated
 
-    Return "New" when the notification originates from diff_added.
+    Return "New" only when the notification appears in diff_added and there is
+    no matching notification in diff_removed.
 
-    Return "Updated" ONLY if BOTH of the following are true:
+    Return "Updated" only when:
 
-    1. The same notification exists in diff_added.
-    2. A previous version of that SAME notification exists in diff_removed.
+    1. The same notification appears in BOTH diff_added and diff_removed.
+    2. The content has materially changed
+    (title, date, status, PDF, result, notice, advertisement,
+    corrigendum, or notification text).
+
+    If the matching content is identical or nearly identical,
+    DO NOT classify it as Updated.
+
+    Instead, classify it as New and reduce confidence,
+    or mention in raw_explanation that the change could not be confirmed.
+
+    Never assume Updated solely because the notification
+    appears in both inputs.
 
     Examples of Updated:
 
@@ -521,10 +562,11 @@ function buildPrompt(payload) {
 }
 
 function generateHash(item, watch_uuid) {
+    console.log(item?.original_title,'---item?.original_title--')
     return crypto
         .createHash("sha256")
         .update(
-            `${watch_uuid}|${item.title}|${item.notification_date}|${item.category}`
+            `${watch_uuid}|${item?.original_title}|${item.notification_date}|${item.category}`
         )
         .digest("hex");
 }
@@ -559,6 +601,10 @@ export const processJob = async (payload) => {
             return true;
         }
 
+        if (data) {
+            const validationResult = isValidAIResponse(data)
+            console.log('validationResult---:', validationResult);
+        }
         for (const item of data.items) {
             const normalizedItem = normalizeNotificationItem(item);
 
@@ -577,7 +623,8 @@ export const processJob = async (payload) => {
             await LatestNotification.create({
                 watch_uuid: data.watch_uuid,
                 title: normalizedItem.title,
-                slug,
+                original_title: item.original_title,
+                    slug,
                 summary: normalizedItem.summary,
                 source_url: normalizedItem.source_url,
                 department: normalizedItem.department,
@@ -596,7 +643,7 @@ export const processJob = async (payload) => {
                 webhook_payload: payload,
                 ai_response: data,
             });
-           console.log("Saved:", normalizedItem.title);
+            console.log("Saved:", normalizedItem.title);
         }
         return true;
     } catch (err) {
