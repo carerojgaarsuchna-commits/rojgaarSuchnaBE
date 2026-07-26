@@ -32,6 +32,9 @@ const LatestNotificationSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    original_title: {
+      type: String,
+    },
 
     slug: {
       type: String,
