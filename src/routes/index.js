@@ -11,6 +11,7 @@ import departmentRoutes from "./departmentRoutes.js";
 import bodiesRoutes from "./bodiesRoutes.js";
 import promptByAi from "./promptByAi.js"
 import webhookRoutes from "./webhook.routes.js"
+import pipelineRoutes from "./pipeline.routes.js"
 const router = express.Router();
 
 router.use("/home", homeRoutes);
@@ -26,5 +27,7 @@ router.use("/bodies", bodiesRoutes);
 router.use('/promptbyai', promptByAi)
 //webhook change deduction
 router.use("/webhook",webhookRoutes) 
+// pipeline admin
+router.use("/pipeline", pipelineRoutes)
 
 export default router;

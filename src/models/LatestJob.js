@@ -105,6 +105,14 @@ const LatestJobSchema = new mongoose.Schema(
       ios: { type: String },
     },
 
+    // === PIPELINE TRACEABILITY ===
+    source_event_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "RawEvent",
+      index: true,
+    },
+    advertisement_no: { type: String, trim: true },
+
     // === STATUS & TIMESTAMPS ===
     status: {
       type: String,

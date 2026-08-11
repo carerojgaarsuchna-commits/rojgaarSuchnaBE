@@ -1,38 +1,27 @@
-import webhookQueue from "../queues/webhook.queue.js"
-import { LatestNotification } from "../models/LatestNotification.js"
-import { latestJobsAIPromptSchema } from "../validators/latestJobsAIPromptValidator.js";
+import { LatestNotification } from "../models/LatestNotification.js";
+import { handleWebhookReceive } from "../services/pipeline/webhookReceive.service.js";
+
 const receiveChange = async (req, res) => {
     try {
-        await webhookQueue.add(
-            "process-webhook",
-            req.body, {
-            removeOnComplete: true,
-            attempts: 3
-        }
-        );
+        const result = await handleWebhookReceive(req.body);
 
-        const counts = await webhookQueue.getJobCounts(
-            "waiting",
-            "active",
-            "completed",
-            "failed"
-        );
-
-        console.log(counts);
         return res.status(200).json({
             success: true,
-            message: "Webhook received",
-            // data: result
+            message: result.message,
+            data: {
+                raw_event_id: result.raw_event_id,
+                status: result.status,
+                duplicate: result.duplicate,
+            },
         });
-
-
     } catch (err) {
+        console.error("[webhook] receiveChange failed:", err.message);
         return res.status(500).json({
-            status: false,
-            message: err.message
-        })
+            success: false,
+            message: err.message,
+        });
     }
-}
+};
 
 const getLetestNotifications = async (req, res, next) => {
     try {
