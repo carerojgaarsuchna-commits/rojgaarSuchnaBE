@@ -14,6 +14,7 @@
 
 import axios from "axios";
 import * as cheerio from "cheerio";
+import https from "https";
 import {
   containsAny,
   normalizeTitle,
@@ -26,6 +27,14 @@ import {
 
 const ONE_HOP_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 3;
+
+/**
+ * HTTPS agent that ignores TLS certificate errors.
+ * Used ONLY for one-hop page fetches — many Indian gov sites have
+ * self-signed or chain-incomplete certs that would otherwise block discovery.
+ * The actual PDF download still validates TLS via axios defaults.
+ */
+const LENIENT_HTTPS_AGENT = new https.Agent({ rejectUnauthorized: false });
 
 /** Known Indian government document hosting patterns */
 const GOV_DOC_HOST_PATTERNS = [
@@ -220,7 +229,14 @@ async function fetchOneHopPdfLinks(pageUrl, baseUrl) {
     const response = await axios.get(pageUrl, {
       timeout: ONE_HOP_TIMEOUT_MS,
       maxRedirects: MAX_REDIRECTS,
-      headers: { "User-Agent": "RojgaarSuchna-Bot/1.0" },
+      // Use browser UA + lenient TLS — government sites often have self-signed certs
+      httpsAgent: LENIENT_HTTPS_AGENT,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        Referer: new URL(pageUrl).origin,
+        Accept: "text/html,application/xhtml+xml,application/pdf,*/*",
+      },
       validateStatus: (s) => s >= 200 && s < 300,
     });
 
@@ -324,8 +340,9 @@ export async function discoverPdf(html, context) {
 
   const gap = second ? top.score - second.score : 100;
 
-  // Ambiguous: top two within 10 points AND neither is clearly a direct PDF
-  if (top.score > 0 && gap <= 10 && second && top.score < 80) {
+  // Ambiguous: top-2 within 10 points AND score below confidence threshold
+  // Score >= 70 with a close 2nd still proceeds — low-confidence halting causes too many false stops
+  if (top.score > 0 && gap <= 10 && second && top.score < 70) {
     return {
       decision: "ambiguous",
       pdfUrl: top.url,

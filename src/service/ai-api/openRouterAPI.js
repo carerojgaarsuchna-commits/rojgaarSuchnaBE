@@ -1,5 +1,4 @@
 import dotenv from "dotenv";
-import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -8,7 +7,7 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export async function openRouterAPI(prompt) {
+export async function openRouterAPI(prompt, model) {
     const apiKey = process.env.OPENROUTER_API_KEY?.trim();
 
     if (!apiKey) {
@@ -16,7 +15,7 @@ export async function openRouterAPI(prompt) {
     }
 
     const apiUrl = "https://openrouter.ai/api/v1/chat/completions";
-    const model = process.env.OPENROUTER_MODEL || "";
+    model = model || process.env.OPENROUTER_MODEL || "";
 
     const headers = {
         Authorization: `Bearer ${apiKey}`,
@@ -60,4 +59,36 @@ export async function openRouterAPI(prompt) {
         throw new Error(result?.error?.message || "OpenRouter error");
     }
     return result?.choices?.[0]?.message?.content;
+}
+
+/**
+ * Call OpenRouter with a vision-capable messages array.
+ * Exported so aiProvider.js can use it directly on the openrouter path.
+ * @param {Array}  messages  — OpenRouter messages array
+ * @param {string} model     — model identifier
+ * @returns {Promise<{ raw: string, latencyMs: number }>}
+ */
+export async function callVisionLlmRaw(messages, model) {
+    const start = Date.now();
+    const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+
+    if (!apiKey) throw new Error("OPENROUTER_API_KEY not configured");
+
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model, messages }),
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+        throw new Error(result?.error?.message || `OpenRouter vision error: ${response.status}`);
+    }
+
+    const raw = result?.choices?.[0]?.message?.content || "";
+    return { raw, latencyMs: Date.now() - start };
 }

@@ -15,16 +15,8 @@
  * It never generates URLs, PDF paths, or database IDs.
  */
 
-import { openRouterAPI } from "../../service/ai-api/openRouterAPI.js";
+import { callTextLlm, callVisionLlm, getTextModel, getVisionModel } from "../../service/ai-api/aiProvider.js";
 import { ALLOWED_NOTIFICATION_CATEGORIES } from "../../utils/notificationCategory.js";
-
-// ─── Models ───────────────────────────────────────────────────────────────────
-
-const TEXT_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.0-flash-001";
-const VISION_MODEL =
-  process.env.OPENROUTER_VISION_MODEL ||
-  process.env.OPENROUTER_MODEL ||
-  "google/gemini-2.0-flash-001";
 
 // ─── Prompt builders ──────────────────────────────────────────────────────────
 
@@ -154,53 +146,6 @@ function parseJsonResponse(raw = "") {
   }
 }
 
-// ─── OpenRouter wrapper ───────────────────────────────────────────────────────
-
-/**
- * Call OpenRouter with a plain text prompt and return raw string.
- * @param {string} prompt
- * @param {string} model
- * @returns {Promise<{raw:string, latencyMs:number}>}
- */
-async function callTextLlm(prompt, model) {
-  const start = Date.now();
-  // openRouterAPI is a simple fetch wrapper — reuse as-is
-  const raw = await openRouterAPI(prompt, model);
-  return { raw: raw || "", latencyMs: Date.now() - start };
-}
-
-/**
- * Call OpenRouter for vision input.
- * Uses native fetch (same pattern as openRouterAPI.js) so we can send image_url content.
- * @param {Array} messages
- * @param {string} model
- * @returns {Promise<{raw:string, latencyMs:number}>}
- */
-async function callVisionLlm(messages, model) {
-  const start = Date.now();
-  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
-
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY not configured");
-
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ model, messages }),
-  });
-
-  const result = await response.json();
-
-  if (!response.ok) {
-    throw new Error(result?.error?.message || `OpenRouter vision error: ${response.status}`);
-  }
-
-  const raw = result?.choices?.[0]?.message?.content || "";
-  return { raw, latencyMs: Date.now() - start };
-}
-
 // ─── Main exports ─────────────────────────────────────────────────────────────
 
 /**
@@ -211,7 +156,7 @@ async function callVisionLlm(messages, model) {
  * @returns {Promise<{ok:boolean, data?:object, raw?:string, latencyMs:number, model:string, exception_calls:number, error?:string}>}
  */
 export async function extractWithTextLlm({ extractedText, matchedTitle, watchTitle, watchUrl }) {
-  const model = TEXT_MODEL;
+  const model = getTextModel();
   const meta = { matchedTitle, watchTitle, watchUrl };
   const prompt = `${buildSystemPrompt()}\n\n${buildTextPrompt(extractedText, meta)}`;
 
@@ -253,7 +198,7 @@ export async function extractWithTextLlm({ extractedText, matchedTitle, watchTit
  * @returns {Promise<{ok:boolean, data?:object, raw?:string, latencyMs:number, model:string, exception_calls:number, error?:string}>}
  */
 export async function extractWithVisionLlm({ pdfBuffer, matchedTitle, watchTitle, watchUrl, extractedText = "" }) {
-  const model = VISION_MODEL;
+  const model = getVisionModel();
   const meta = { matchedTitle, watchTitle, watchUrl };
   const pdfBase64 = pdfBuffer.toString("base64");
   const messages = buildVisionMessages(pdfBase64, meta);

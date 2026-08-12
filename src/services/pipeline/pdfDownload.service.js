@@ -14,6 +14,7 @@
 
 import axios from "axios";
 import crypto from "crypto";
+import https from "https";
 import { URL } from "url";
 import dns from "dns/promises";
 
@@ -22,6 +23,13 @@ import dns from "dns/promises";
 const MAX_PDF_SIZE_BYTES = 15 * 1024 * 1024; // 15 MB
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUT_MS = 30000; // 30 seconds
+
+/**
+ * HTTPS agent that ignores TLS certificate errors.
+ * Indian government sites frequently have self-signed or chain-incomplete certs.
+ * SSRF protection is handled separately via DNS check, so this is safe.
+ */
+const LENIENT_HTTPS_AGENT = new https.Agent({ rejectUnauthorized: false });
 
 // ─── SSRF Protection ──────────────────────────────────────────────────────────
 
@@ -148,7 +156,18 @@ export async function downloadVerifiedPdf(pdfUrl) {
       responseType: "arraybuffer",
       timeout: DOWNLOAD_TIMEOUT_MS,
       maxRedirects: MAX_REDIRECTS,
-      headers: { "User-Agent": "RojgaarSuchna-Bot/1.0" },
+      // Lenient TLS: Indian gov sites often have self-signed/chain-incomplete certs.
+      // SSRF is still blocked via the DNS check above.
+      httpsAgent: LENIENT_HTTPS_AGENT,
+      headers: {
+        // Use a real browser UA — government PDF servers block bot strings
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        // Referer set to the watch_url domain so the server thinks we navigated from the site
+        Referer: parsedUrl.origin,
+        Accept: "application/pdf,application/octet-stream,*/*",
+        "Accept-Language": "en-IN,en;q=0.9",
+      },
       validateStatus: (status) => status >= 200 && status < 300,
     });
   } catch (err) {

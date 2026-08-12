@@ -101,6 +101,24 @@ async function processPdfJob(rawEventId) {
       diffAdded: webhookPayload.diff_added || webhookPayload.diff || "",
     };
 
+    // If the matched href is an image file (.jpg/.png/etc), one-hop discovery
+    // will just get binary image data — useless. Instead, swap in the first
+    // sibling candidate from matching that has a .pdf href.
+    const IMAGE_EXTENSIONS = /\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$/i;
+    if (IMAGE_EXTENSIONS.test(discoveryContext.matchedHref)) {
+      const pdfSibling = (matched.candidates || []).find(
+        (c) => c.href && /\.pdf(\?.*)?$/i.test(c.href)
+      );
+      if (pdfSibling) {
+        console.log(
+          "[pipeline-pdf]", rawEventId,
+          "— matched href is an image, using sibling PDF candidate:", pdfSibling.href
+        );
+        discoveryContext.matchedHref = pdfSibling.href;
+        discoveryContext.matchedTitle = pdfSibling.title || discoveryContext.matchedTitle;
+      }
+    }
+
     // ── 2. PDF Discovery ──────────────────────────────────────────────────────
     const discovery = await discoverPdf(html, discoveryContext);
 

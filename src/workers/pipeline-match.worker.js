@@ -15,7 +15,77 @@ import { RawEvent } from "../models/RawEvent.js";
 import { PIPELINE_STATUS } from "../constants/pipelineStatus.js";
 import { updateRawEventStatus } from "../services/pipeline/rawEvent.service.js";
 import { runMatching } from "../services/pipeline/matching.service.js";
+import { callTextLlm, getTextModel } from "../service/ai-api/aiProvider.js";
 import pipelinePdfQueue from "../queues/pipeline-pdf.queue.js";
+
+// ─── LLM disambiguation ──────────────────────────────────────────────────────
+
+/**
+ * Ask the LLM to pick the best candidate from an ambiguous set.
+ * Exception budget: max 1 call per event (per plan).
+ *
+ * @param {string} diffAdded          — the diff_added text from the webhook
+ * @param {string} watchTitle         — site name for context
+ * @param {Array}  candidates         — top candidates [{title, href, score}]
+ * @returns {Promise<{title,href}|null>}  — chosen candidate or null on failure
+ */
+async function disambiguateWithLlm(diffAdded, watchTitle, candidates) {
+  const model = getTextModel();
+
+  // Extract newly relevant lines from the diff:
+  // (added) lines = brand-new items added to the page (highest priority)
+  // (into)  lines = modified existing items (also relevant)
+  const addedLines = diffAdded
+    .split("\n")
+    .filter((l) => l.trimStart().startsWith("(added)"))
+    .map((l) => l.replace(/^\s*\(added\)\s*/, "").trim())
+    .filter(Boolean);
+
+  const intoLines = diffAdded
+    .split("\n")
+    .filter((l) => l.trimStart().startsWith("(into)"))
+    .map((l) => l.replace(/^\s*\(into\)\s*/, "").trim())
+    .filter(Boolean);
+
+  // Combine: newly added first (most important), then modified
+  const parts = [];
+  if (addedLines.length) parts.push("NEWLY ADDED:\n" + addedLines.join("\n"));
+  if (intoLines.length) parts.push("UPDATED ITEMS:\n" + intoLines.join("\n"));
+  const diffContext = parts.length ? parts.join("\n\n") : diffAdded.slice(0, 1500);
+
+  const candidateLines = candidates
+    .map((c, i) => `${i + 1}. Title: "${c.title}"\n   URL:   ${c.href}`)
+    .join("\n");
+
+  const prompt = `You are a government recruitment notification classifier for the Indian job portal Rojgaar Suchna.
+
+A website ("${watchTitle}") was updated. Here is what changed:
+---
+${diffContext.slice(0, 1500)}
+---
+
+These are the top matching notification links found on the page:
+${candidateLines}
+
+Which single link (by number) best matches the change above?
+IMPORTANT: Prefer links that end in .pdf over image files (.jpg/.png).
+Return ONLY a JSON object: { "choice": <number 1-${candidates.length}> }
+No other text.`;
+
+  try {
+    const { raw } = await callTextLlm(prompt, model);
+    // Strip markdown fences if present
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    const parsed = JSON.parse(cleaned);
+    const idx = parseInt(parsed?.choice, 10) - 1;
+    if (!isNaN(idx) && idx >= 0 && idx < candidates.length) {
+      return candidates[idx];
+    }
+  } catch (err) {
+    console.warn("[pipeline-match] LLM disambiguation failed:", err.message);
+  }
+  return null;
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -123,12 +193,35 @@ async function processMatchJob(rawEventId) {
     }
 
     if (decision === "ambiguous") {
-      // Store ambiguous result and route to pending_review.
-      // LLM disambiguation (exception-budget call) can be added here in a later chunk.
-      await updateRawEventStatus(rawEventId, PIPELINE_STATUS.PENDING_REVIEW, {
-        matched_notification,
-        status_note: "Ambiguous match — requires manual review or LLM disambiguation",
-      });
+      // Exception-budget: one LLM call to pick the best candidate
+      console.log("[pipeline-match]", rawEventId, "— calling LLM to disambiguate");
+      const chosen = await disambiguateWithLlm(
+        context.diff_added,
+        context.watch_title,
+        matched_notification.candidates
+      );
+
+      if (chosen) {
+        // LLM resolved ambiguity → treat as matched, proceed to PDF
+        const resolvedNotification = {
+          ...matched_notification,
+          title: chosen.title,
+          href: chosen.href,
+          method: "llm",
+        };
+        await updateRawEventStatus(rawEventId, PIPELINE_STATUS.MATCHED, {
+          matched_notification: resolvedNotification,
+        });
+        await enqueuePipelinePdf(rawEventId);
+        console.log("[pipeline-match]", rawEventId, "— LLM chose:", chosen.title);
+      } else {
+        // LLM failed or returned invalid — fall back to manual review
+        await updateRawEventStatus(rawEventId, PIPELINE_STATUS.PENDING_REVIEW, {
+          matched_notification,
+          status_note: "Ambiguous match — LLM disambiguation failed, requires manual review",
+        });
+        console.warn("[pipeline-match]", rawEventId, "— LLM disambiguation failed, sent to pending_review");
+      }
       return;
     }
 

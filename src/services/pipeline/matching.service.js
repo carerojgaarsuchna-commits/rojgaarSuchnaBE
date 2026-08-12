@@ -164,6 +164,12 @@ export function scoreCandidate(candidate, context) {
     // URL parse failed — skip domain check
   }
 
+  // 6. Penalize image-only hrefs — a .jpg/.png is never a notification document.
+  // This prevents image links from tying with PDF links in score.
+  if (/\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$/i.test(hrefLower)) {
+    score = Math.max(0, score - 5);
+  }
+
   return Math.min(score, 100);
 }
 
