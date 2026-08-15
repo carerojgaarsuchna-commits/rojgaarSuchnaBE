@@ -1,24 +1,86 @@
 import { LatestNotification } from "../models/LatestNotification.js";
-import { handleWebhookReceive } from "../services/pipeline/webhookReceive.service.js";
+import webhookQueue from "../queues/webhook.queue.js";
+import { createRawEvent } from "../services/pipeline/rawEvent.service.js";
+import { stripSecretFromPayload, buildEventHash } from "../service/webhook.service.js";
 
+/**
+ * Fast Webhook Receiver Controller (<100ms response time).
+ * 
+ * 1. Validates webhook secret key (if configured in .env).
+ * 2. Strips secret key from payload to protect credentials.
+ * 3. Calculates event_hash and checks for early duplicate webhooks.
+ * 4. Logs raw event to Database.
+ * 5. Pushes payload to single BullMQ 'webhook' queue.
+ * 6. Immediately responds 200 OK to changedetection.io.
+ */
 const receiveChange = async (req, res) => {
     try {
-        const result = await handleWebhookReceive(req.body);
+        const rawPayload = req.body || {};
 
+        // Step 1: Secret verification guard (if secret key is set in .env)
+        const expectedSecret = process.env.CHANGEDETECTION_SECRET;
+        if (expectedSecret && rawPayload.secret && rawPayload.secret !== expectedSecret) {
+            console.warn("⚠️ [Webhook Controller] Unauthorized webhook attempt - Secret key mismatch!");
+            return res.status(401).json({
+                success: false,
+                message: "Unauthorized: Invalid secret key",
+            });
+        }
+
+        // Step 2: Strip secret key from payload before storage & queueing
+        const safePayload = stripSecretFromPayload(rawPayload);
+
+        // Step 3: Calculate SHA-256 event hash for early deduplication
+        const eventHash = buildEventHash(
+            safePayload.watch_uuid,
+            safePayload.change_datetime,
+            safePayload.diff_added
+        );
+        safePayload.event_hash = eventHash;
+
+        // Step 4: Early deduplication check via RawEvent model
+        const { isDuplicate, rawEvent } = await createRawEvent(safePayload);
+
+        if (isDuplicate) {
+            console.log(`🔁 [Webhook Controller] Duplicate webhook event ignored: Hash ${eventHash}`);
+            return res.status(200).json({
+                success: true,
+                message: "Duplicate webhook ignored",
+                data: {
+                    status: "ignored_duplicate",
+                    event_hash: eventHash,
+                },
+            });
+        }
+
+        // Step 5: Enqueue payload into BullMQ single worker queue
+        await webhookQueue.add("process-webhook", safePayload, {
+            attempts: 3,
+            backoff: {
+                type: "exponential",
+                delay: 5000,
+            },
+            removeOnComplete: 100,
+            removeOnFail: 500,
+        });
+
+        console.log(`📥 [Webhook Controller] Webhook queued successfully for Watch: ${safePayload.watch_title || safePayload.watch_uuid}`);
+
+        // Step 6: Instant HTTP 200 OK Response (<100ms)
         return res.status(200).json({
             success: true,
-            message: result.message,
+            message: "Webhook received and queued successfully",
             data: {
-                raw_event_id: result.raw_event_id,
-                status: result.status,
-                duplicate: result.duplicate,
+                raw_event_id: rawEvent._id,
+                status: "queued",
+                event_hash: eventHash,
             },
         });
     } catch (err) {
-        console.error("[webhook] receiveChange failed:", err.message);
+        console.error("❌ [Webhook Controller Error] receiveChange failed:", err.message);
         return res.status(500).json({
             success: false,
-            message: err.message,
+            message: `Webhook processing error: ${err.message}`,
         });
     }
 };

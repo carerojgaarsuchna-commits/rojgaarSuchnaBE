@@ -11,9 +11,9 @@
  */
 
 import { RawEvent } from "../models/RawEvent.js";
+import { LatestNotification } from "../models/LatestNotification.js";
 import { PIPELINE_STATUS } from "../constants/pipelineStatus.js";
 import { updateRawEventStatus } from "../services/pipeline/rawEvent.service.js";
-import pipelinePublishQueue from "../queues/pipeline-publish.queue.js";
 
 // ─── GET /api/pipeline/events ─────────────────────────────────────────────────
 
@@ -124,34 +124,58 @@ export const approveEvent = async (req, res, next) => {
       });
     }
 
-    // Must have validated structured data
-    if (!event.validation?.structured_data) {
+    const data = event.validation?.structured_data || event.ai?.data || {};
+
+    if (!data.title) {
       return res.status(400).json({
         success: false,
-        message: "Event has no validated structured_data — cannot publish. Edit fields first.",
+        message: "Event has no title or structured data — cannot publish. Edit fields first.",
       });
     }
 
-    // Enqueue publish
-    await pipelinePublishQueue.add(
-      "pipeline-publish",
-      { raw_event_id: String(event._id) },
+    const dedupeHash = event.dedupe_hash || `event-${event._id}`;
+    const slug = data.slug || data.title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+    // Directly publish to LatestNotification collection
+    await LatestNotification.findOneAndUpdate(
+      { dedupe_hash: dedupeHash },
       {
-        removeOnComplete: true,
-        attempts: 3,
-        backoff: { type: "exponential", delay: 3000 },
-      }
+        $set: {
+          watch_uuid: event.watch_uuid || "admin-manual",
+          source_url: event.watch_url || "",
+          body: data.body || data.title,
+          department: data.department || "",
+          title: data.title,
+          original_title: data.original_title || event.watch_title || data.title,
+          slug,
+          summary: data.summary || data.title,
+          category: data.category || "Result",
+          notification_type: data.notification_type || "Other",
+          notification_date: data.notification_date ? new Date(data.notification_date) : new Date(),
+          publish: true,
+          status: "published",
+          dedupe_hash: dedupeHash,
+          ai: {
+            confidence: 100,
+            explanation: "Approved by Admin",
+            model: "admin-approval",
+            extracted_at: new Date(),
+          },
+          webhook_payload: event.webhook_payload,
+        },
+      },
+      { upsert: true, new: true }
     );
 
-    await updateRawEventStatus(event._id, PIPELINE_STATUS.PUBLISHING, {
+    await updateRawEventStatus(event._id, PIPELINE_STATUS.PUBLISHED, {
       "review.approved_at": new Date(),
       "review.action": "approved",
-      status_note: "Admin approved — publish queued",
+      status_note: "Admin approved and published directly",
     });
 
     return res.status(200).json({
       success: true,
-      message: "Event approved and queued for publishing",
+      message: "Event approved and published successfully",
     });
   } catch (err) {
     next(err);

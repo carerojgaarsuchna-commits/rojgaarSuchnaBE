@@ -1,10 +1,73 @@
-import { openRouterAPI } from "./ai-api/openRouterAPI.js";
+import { callTextLlm, getTextModel } from "./ai-api/aiProvider.js";
 import crypto from "crypto";
+import axios from "axios";
 import { LatestNotification } from "../models/LatestNotification.js";
 import {
     normalizeNotificationCategory,
 } from "../utils/notificationCategory.js";
-import { buildSlug, generateUniqueSlug, isValidAIResponse } from "../utils/helper.js"
+import { buildSlug, generateUniqueSlug, isValidAIResponse } from "../utils/helper.js";
+
+/**
+ * Clean full page HTML snapshot for AI processing.
+ * 
+ * Why: Raw HTML contains scripts, styles, headers, footers, and SVGs that waste AI tokens.
+ * What it does:
+ * 1. Removes script, style, nav, footer, header tags and SVGs.
+ * 2. Converts relative links (e.g. href="/pdf/notice.pdf") to absolute links (e.g. https://ssc.gov.in/pdf/notice.pdf).
+ * 3. Keeps clean HTML with clickable links preserved.
+ */
+export function cleanHtmlSnapshot(rawHtml, baseUrl = "") {
+    if (!rawHtml || typeof rawHtml !== "string") {
+        return "";
+    }
+
+    let html = rawHtml;
+
+    // Remove script, style, nav, footer, header, svg tags and their content
+    html = html.replace(/<(script|style|nav|footer|header|svg)[\s\S]*?<\/\1>/gi, "");
+
+    // Remove inline base64 images to save tokens
+    html = html.replace(/src=["']data:image\/[^"']+["']/gi, 'src=""');
+
+    // Convert relative href links to absolute URLs if baseUrl is provided
+    if (baseUrl) {
+        html = html.replace(/href=["']([^"']+)["']/gi, (match, hrefValue) => {
+            try {
+                // Ignore javascript:, mailto:, tel:, # anchor links
+                if (hrefValue.startsWith("javascript:") || hrefValue.startsWith("mailto:") || hrefValue.startsWith("#")) {
+                    return match;
+                }
+                const absoluteUrl = new URL(hrefValue, baseUrl).href;
+                return `href="${absoluteUrl}"`;
+            } catch (err) {
+                // If URL parsing fails, keep original href
+                return match;
+            }
+        });
+    }
+
+    // Collapse multiple blank lines or extra whitespace
+    return html.replace(/\n\s*\n/g, "\n").trim();
+}
+
+/**
+ * Generate unique SHA-256 hash for incoming webhook event.
+ * Used at the controller level to discard duplicate webhooks instantly.
+ */
+export function buildEventHash(watchUuid, changeDatetime, diffAdded = "") {
+    const rawString = `${watchUuid || ""}|${changeDatetime || ""}|${diffAdded || ""}`;
+    return crypto.createHash("sha256").update(rawString).digest("hex");
+}
+
+/**
+ * Remove secret key from payload before saving to Database or BullMQ queue.
+ * Keeps system credentials safe in logs and DB records.
+ */
+export function stripSecretFromPayload(payload) {
+    if (!payload || typeof payload !== "object") return {};
+    const { secret, ...safePayload } = payload;
+    return safePayload;
+}
 function buildPrompt(payload) {
     const {
         watch_uuid,
@@ -561,12 +624,105 @@ function buildPrompt(payload) {
     `
 }
 
+/**
+ * Safely download a PDF file and extract plain text content.
+ * Returns { success: true, text } or { success: false, error }.
+ */
+export async function downloadAndExtractPdfText(pdfUrl) {
+    try {
+        console.log(`📥 [PDF Fetch] Downloading PDF from: ${pdfUrl}`);
+        const response = await axios.get(pdfUrl, {
+            responseType: "arraybuffer",
+            timeout: 15000, // 15 seconds timeout
+            maxContentLength: 10 * 1024 * 1024, // Maximum 10MB file size limit
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RojgaarSuchnaBot/3.0",
+            },
+        });
+
+        const buffer = Buffer.from(response.data);
+        const pdfModule = await import("pdf-parse");
+        const pdfParse = pdfModule.default || pdfModule;
+        const parsed = await pdfParse(buffer);
+        const extractedText = (parsed.text || "").trim();
+
+        if (!extractedText) {
+            return { success: false, error: "Extracted PDF text is empty (scanned image PDF)" };
+        }
+
+        console.log(`✅ [PDF Fetch] Successfully extracted ${extractedText.length} characters from PDF.`);
+        return { success: true, text: extractedText };
+    } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        console.error(`⚠️ [PDF Fetch Warning] Failed to download or parse PDF (${pdfUrl}): ${errorMsg}`);
+        return { success: false, error: errorMsg };
+    }
+}
+
+/**
+ * Build Pass 2 AI Prompt when PDF text is available.
+ * PDF content is treated as authoritative over webpage metadata.
+ */
+function buildPass2Prompt(pass1Item, pdfText) {
+    return `
+You are the content refinement engine for "Rojgaar Suchna".
+We have already extracted preliminary notification data from a website change (Pass 1).
+Now, we have extracted the FULL TEXT of the official PDF document related to this notification.
+
+==================================================
+PASS 1 EXTRACTED ITEM
+==================================================
+${JSON.stringify(pass1Item, null, 2)}
+
+==================================================
+OFFICIAL PDF CONTENT (AUTHORITATIVE)
+==================================================
+${pdfText.slice(0, 15000)}
+
+==================================================
+INSTRUCTIONS
+==================================================
+1. Treat the OFFICIAL PDF CONTENT as authoritative.
+2. Refine the title, summary, department, body, and notification_date based on the official PDF text.
+3. Keep the category strictly one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender.
+4. Return ONLY valid JSON in the exact same format:
+
+{
+    "title": "Refined Title Case Title",
+    "original_title": "${pass1Item.original_title || ""}",
+    "summary": "Updated summary from PDF...",
+    "source_url": "${pass1Item.source_url || ""}",
+    "department": "Ministry/Department Name",
+    "body": "Detailed notification body",
+    "category": "${pass1Item.category || "Job"}",
+    "notification_type": "${pass1Item.notification_type || "Recruitment Advertisement"}",
+    "notification_date": "YYYY-MM-DD",
+    "new_or_updated": "${pass1Item.new_or_updated || "New"}",
+    "confidence": 95,
+    "raw_explanation": "Refined using Pass 2 PDF text extraction."
+}
+`;
+}
+
+/**
+ * Strict safety guard before publishing any notification.
+ * Returns true if notification meets all quality & confidence criteria.
+ */
+export function safeToPublish(item) {
+    if (!item) return false;
+    if (item.relevant === false) return false;
+    if (item.is_duplicate === true) return false;
+    if (item.pdf_download_failed === true) return false;
+    if (typeof item.confidence === "number" && item.confidence < 70) return false;
+    if (!item.title || !item.category || !item.source_url) return false;
+    return true;
+}
+
 function generateHash(item, watch_uuid) {
-    console.log(item?.original_title,'---item?.original_title--')
     return crypto
         .createHash("sha256")
         .update(
-            `${watch_uuid}|${item?.original_title}|${item.notification_date}|${item.category}`
+            `${watch_uuid}|${item?.original_title || item?.title || ""}|${item?.notification_date || ""}|${item?.category || ""}`
         )
         .digest("hex");
 }
@@ -589,66 +745,137 @@ function normalizeNotificationItem(item) {
     };
 }
 
+/**
+ * Core V3 Webhook Processing Engine (2-Pass Adaptive AI Pipeline).
+ */
 export const processJob = async (payload) => {
     try {
-        const prompt = buildPrompt(payload);
-        const aiResponse = await openRouterAPI(prompt);
-        // aiResponse is a string
-        const data = JSON.parse(aiResponse);
+        console.log(`🚀 [V3 Pipeline] Processing job for Watch: ${payload.watch_title || payload.watch_uuid}`);
 
-        if (!data.relevant) {
-            console.log("Not relevant:", data.reason);
-            return true;
+        // Step 1: Clean HTML snapshot if provided to optimize AI context
+        const cleanedHtml = cleanHtmlSnapshot(payload.snapshot_html || payload.html, payload.watch_url);
+        const enrichedPayload = {
+            ...payload,
+            snapshot_html: cleanedHtml,
+        };
+
+        // Step 2: Pass 1 AI Analysis (Webpage change + HTML analysis)
+        const promptPass1 = buildPrompt(enrichedPayload);
+        const modelName = getTextModel();
+        
+        console.log(`🤖 [Pass 1 AI] Sending prompt using model: ${modelName}`);
+        const pass1Result = await callTextLlm(promptPass1, modelName);
+        
+        let data;
+        try {
+            // Clean markdown blocks if present in raw response
+            const cleanedRaw = (pass1Result.raw || "")
+                .replace(/```json/gi, "")
+                .replace(/```/g, "")
+                .trim();
+            data = JSON.parse(cleanedRaw);
+        } catch (jsonErr) {
+            console.error(`❌ [JSON Parse Error] AI response was not valid JSON: ${pass1Result.raw}`);
+            throw new Error(`AI returned invalid JSON: ${jsonErr.message}`);
         }
 
-        if (data) {
-            const validationResult = isValidAIResponse(data)
-            console.log('validationResult---:', validationResult);
+        // Step 3: Fast exit if change is noise or irrelevant
+        if (!data || !data.relevant || !Array.isArray(data.items) || data.items.length === 0) {
+            console.log(`ℹ️ [V3 Pipeline] Event ignored. Reason: ${data?.reason || "Not relevant recruitment change"}`);
+            return { processed: true, relevant: false, reason: data?.reason };
         }
-        for (const item of data.items) {
+
+        console.log(`📌 [Pass 1 AI] Found ${data.items.length} potential notification(s).`);
+
+        // Step 4: Process each notification item (Pass 2 PDF Fallback & Publishing)
+        for (let item of data.items) {
+            // Check if PDF url exists and backend fetch is required
+            if (item.pdf_url && item.pdf_needs_backend_fetch) {
+                console.log(`📄 [PDF Fallback] Item requires backend PDF extraction: ${item.pdf_url}`);
+                const pdfResult = await downloadAndExtractPdfText(item.pdf_url);
+
+                if (pdfResult.success) {
+                    // Pass 2 AI call to refine content using official PDF text
+                    const promptPass2 = buildPass2Prompt(item, pdfResult.text);
+                    console.log(`🤖 [Pass 2 AI] Refining item with official PDF content...`);
+                    const pass2Response = await callTextLlm(promptPass2, modelName);
+                    
+                    try {
+                        const cleanedPass2Raw = (pass2Response.raw || "")
+                            .replace(/```json/gi, "")
+                            .replace(/```/g, "")
+                            .trim();
+                        const pass2RefinedItem = JSON.parse(cleanedPass2Raw);
+                        
+                        // Merge Pass 2 refinements into item
+                        item = {
+                            ...item,
+                            ...pass2RefinedItem,
+                            pdf_url: item.pdf_url, // keep original PDF link
+                        };
+                        console.log(`✨ [Pass 2 AI] Item successfully refined using official PDF!`);
+                    } catch (p2Err) {
+                        console.warn(`⚠️ [Pass 2 Warning] Could not parse Pass 2 JSON response, falling back to Pass 1 item.`);
+                    }
+                } else {
+                    // PDF download/parsing failed: mark for review instead of publishing incomplete blog
+                    item.pdf_download_failed = true;
+                    item.confidence = Math.min(item.confidence || 50, 55);
+                    item.raw_explanation = `${item.raw_explanation || ""} [PDF Download Failed: ${pdfResult.error}]`.trim();
+                }
+            }
+
+            // Step 5: Normalize category & build deduplication hash
             const normalizedItem = normalizeNotificationItem(item);
-
             const dedupeHash = generateHash(normalizedItem, data.watch_uuid);
+
+            // Step 6: Deduplication Check in Database
+            const existingNotification = await LatestNotification.findOne({ dedupe_hash: dedupeHash });
+            if (existingNotification) {
+                console.log(`🔁 [Deduplication] Notification already exists in DB: "${normalizedItem.title}"`);
+                normalizedItem.is_duplicate = true;
+                continue;
+            }
+
+            // Step 7: Check safeToPublish guard
+            const isPublishable = safeToPublish(normalizedItem);
             const baseSlug = buildSlug(normalizedItem);
             const slug = await generateUniqueSlug(baseSlug, LatestNotification);
 
-            const existing = await LatestNotification.findOne({
-                dedupe_hash: dedupeHash
-            });
-
-            if (existing) {
-                console.log("Duplicate notification:", normalizedItem.title);
-                continue;
-            }
-            await LatestNotification.create({
+            // Step 8: Save to Database
+            const savedDoc = await LatestNotification.create({
                 watch_uuid: data.watch_uuid,
                 title: normalizedItem.title,
-                original_title: item.original_title,
-                    slug,
+                original_title: normalizedItem.original_title || item.original_title || normalizedItem.title,
+                slug,
                 summary: normalizedItem.summary,
-                source_url: normalizedItem.source_url,
-                department: normalizedItem.department,
-                body: normalizedItem.body,
+                source_url: normalizedItem.source_url || payload.watch_url,
+                pdf_url: normalizedItem.pdf_url || null,
+                department: normalizedItem.department || payload.watch_title,
+                body: normalizedItem.body || normalizedItem.summary,
                 category: normalizedItem.category,
-                notification_type: normalizedItem.notification_type,
-                notification_date: normalizedItem.notification_date,
-                new_or_updated: normalizedItem.new_or_updated,
-                publish: data.publish ?? true,
+                notification_type: normalizedItem.notification_type || "Notice",
+                notification_date: normalizedItem.notification_date || new Date().toISOString().split("T")[0],
+                new_or_updated: normalizedItem.new_or_updated || "New",
+                publish: isPublishable,
+                status: isPublishable ? "published" : "needs_review",
                 dedupe_hash: dedupeHash,
                 ai: {
-                    confidence: normalizedItem.confidence,
-                    explanation: normalizedItem.raw_explanation,
-                    model: process.env.OPENROUTER_MODEL,
+                    confidence: normalizedItem.confidence || 80,
+                    explanation: normalizedItem.raw_explanation || "",
+                    model: modelName,
                 },
                 webhook_payload: payload,
                 ai_response: data,
             });
-            console.log("Saved:", normalizedItem.title);
+
+            console.log(`✅ [Database Saved] Notification stored with status "${savedDoc.status}": "${savedDoc.title}"`);
         }
-        return true;
+
+        return { processed: true, relevant: true };
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(message);
+        console.error(`❌ [V3 Pipeline Error] AI Processing failed: ${message}`);
         throw new Error(`AI processing failed: ${message}`);
     }
 };
