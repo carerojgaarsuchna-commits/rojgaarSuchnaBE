@@ -168,6 +168,7 @@ function buildPrompt(payload, recentDocs = []) {
         diff,
         diff_added,
         diff_removed,
+        snapshot_html,
     } = payload;
 
     const recentContext = recentDocs.length > 0
@@ -330,8 +331,9 @@ ${recentDocs.map(d =>
     ==================================================
 
     pdf_url:
+    - here if wbsite html ${snapshot_html} first you have to find the excet "diff_added" in the html.
     - If the notification has a direct link to an official PDF document visible in diff_added, set this to the full absolute URL.
-    - If the link is relative (e.g. /pdf/notice.pdf), resolve it against the Website URL above to form the full URL.
+    - If the link is relative (e.g. /pdf/notice.pdf (Note: Many goverment site not use .pdf for the pdf you have make sure about it)), resolve it against the Website URL above to form the full URL.
     - If no PDF link is visible, set to null.
     - Do NOT invent PDF URLs. Only use links explicitly visible in the content.
 
