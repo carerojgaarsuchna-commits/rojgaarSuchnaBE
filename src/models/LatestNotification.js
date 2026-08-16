@@ -9,9 +9,28 @@ const LatestNotificationSchema = new mongoose.Schema(
       required: true,
     },
 
+    // Link back to the RawEvent that produced this notification (for audit trail)
+    source_event_id: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "RawEvent",
+      index: true,
+    },
+
     source_url: {
       type: String,
       required: true,
+      trim: true,
+    },
+
+    // Official PDF document link (extracted by AI from webhook diff/HTML)
+    pdf_url: {
+      type: String,
+      trim: true,
+    },
+
+    // AI-generated full blog article in Markdown format (for direct frontend rendering)
+    markdown_body: {
+      type: String,
       trim: true,
     },
 

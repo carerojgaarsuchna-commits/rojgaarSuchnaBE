@@ -1,74 +1,165 @@
+import { z } from "zod";
 import { callTextLlm, getTextModel } from "./ai-api/aiProvider.js";
 import crypto from "crypto";
 import axios from "axios";
 import { LatestNotification } from "../models/LatestNotification.js";
-import {
-    normalizeNotificationCategory,
-} from "../utils/notificationCategory.js";
-import { buildSlug, generateUniqueSlug, isValidAIResponse } from "../utils/helper.js";
+import { normalizeNotificationCategory } from "../utils/notificationCategory.js";
+import { buildSlug, generateUniqueSlug } from "../utils/helper.js";
+// import { createAIBlog } from "./latestJobsService.js";
+import { updateRawEventStatus } from "../services/pipeline/rawEvent.service.js";
+import { PIPELINE_STATUS } from "../constants/pipelineStatus.js";
+
+// ─── Env config ───────────────────────────────────────────────────────────────
+const PDF_TIMEOUT_MS = Number(process.env.PDF_TIMEOUT_MS) || 15000;
+const PDF_MAX_BYTES = Number(process.env.PDF_MAX_BYTES) || 10 * 1024 * 1024; // 10 MB
+const PDF_TEXT_LIMIT = Number(process.env.PDF_TEXT_LIMIT) || 15000;
+
+// ─── Zod schemas for AI output validation ────────────────────────────────────
+
+const Pass1ItemSchema = z.object({
+    title: z.string().min(1),
+    original_title: z.string().min(1),
+    summary: z.string().min(1),
+    source_url: z.string().min(1),
+    department: z.string().optional().default(""),
+    body: z.string().optional().default(""),
+    category: z.string().min(1),
+    notification_type: z.string().optional().default("Other"),
+    notification_date: z.string().optional().default(""),
+    new_or_updated: z.enum(["New", "Updated"]).optional().default("New"),
+    confidence: z.number().min(0).max(100).optional().default(80),
+    raw_explanation: z.string().optional().default(""),
+    pdf_url: z.string().nullable().optional(),
+    pdf_needs_backend_fetch: z.boolean().optional().default(false),
+    is_duplicate: z.boolean().optional().default(false),
+});
+
+const Pass1ResponseSchema = z.union([
+    // Irrelevant case
+    z.object({
+        relevant: z.literal(false),
+        reason: z.string().optional(),
+    }),
+    // Relevant case
+    z.object({
+        relevant: z.literal(true),
+        publish: z.boolean().optional(),
+        watch_uuid: z.string().optional(),
+        items: z.array(Pass1ItemSchema).min(1),
+    }),
+]);
+
+const Pass2ItemSchema = z.object({
+    title: z.string().min(1),
+    original_title: z.string().optional(),
+    summary: z.string().optional(),
+    source_url: z.string().optional(),
+    pdf_url: z.string().nullable().optional(),
+    department: z.string().optional().default(""),
+    body: z.string().optional().default(""),
+    category: z.string().optional(),
+    notification_type: z.string().optional(),
+    notification_date: z.string().optional(),
+    new_or_updated: z.enum(["New", "Updated"]).optional(),
+    confidence: z.number().min(0).max(100).optional(),
+    raw_explanation: z.string().optional(),
+    markdown_body: z.string().optional(),
+});
+
+// ─── JSON extraction ──────────────────────────────────────────────────────────
+
+/**
+ * Extract the outermost JSON object from raw LLM text.
+ * Handles: plain JSON, ```json fences, prose-wrapped JSON.
+ * Strategy: strip fences → find first { → find matching last } by balance.
+ */
+export function extractJsonFromText(rawText) {
+    if (!rawText || typeof rawText !== "string") return null;
+
+    let text = rawText.trim();
+
+    // Strip markdown code fences: ```json ... ``` or ``` ... ```
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+
+    // Find first {
+    const start = text.indexOf("{");
+    if (start === -1) return null;
+
+    // Find matching last } by tracking brace depth
+    let depth = 0;
+    let end = -1;
+    for (let i = start; i < text.length; i++) {
+        if (text[i] === "{") depth++;
+        else if (text[i] === "}") {
+            depth--;
+            if (depth === 0) { end = i; break; }
+        }
+    }
+
+    if (end === -1) return null;
+    return text.slice(start, end + 1);
+}
+
+// ─── HTML cleaning ────────────────────────────────────────────────────────────
 
 /**
  * Clean full page HTML snapshot for AI processing.
- * 
- * Why: Raw HTML contains scripts, styles, headers, footers, and SVGs that waste AI tokens.
- * What it does:
- * 1. Removes script, style, nav, footer, header tags and SVGs.
- * 2. Converts relative links (e.g. href="/pdf/notice.pdf") to absolute links (e.g. https://ssc.gov.in/pdf/notice.pdf).
- * 3. Keeps clean HTML with clickable links preserved.
+ * Removes scripts, styles, nav, footer, SVGs and converts relative links to absolute.
  */
 export function cleanHtmlSnapshot(rawHtml, baseUrl = "") {
-    if (!rawHtml || typeof rawHtml !== "string") {
-        return "";
-    }
+    if (!rawHtml || typeof rawHtml !== "string") return "";
 
     let html = rawHtml;
 
-    // Remove script, style, nav, footer, header, svg tags and their content
+    // Remove noise tags
     html = html.replace(/<(script|style|nav|footer|header|svg)[\s\S]*?<\/\1>/gi, "");
 
-    // Remove inline base64 images to save tokens
+    // Remove inline base64 images
     html = html.replace(/src=["']data:image\/[^"']+["']/gi, 'src=""');
 
-    // Convert relative href links to absolute URLs if baseUrl is provided
+    // Convert relative hrefs to absolute
     if (baseUrl) {
         html = html.replace(/href=["']([^"']+)["']/gi, (match, hrefValue) => {
             try {
-                // Ignore javascript:, mailto:, tel:, # anchor links
-                if (hrefValue.startsWith("javascript:") || hrefValue.startsWith("mailto:") || hrefValue.startsWith("#")) {
-                    return match;
-                }
-                const absoluteUrl = new URL(hrefValue, baseUrl).href;
-                return `href="${absoluteUrl}"`;
-            } catch (err) {
-                // If URL parsing fails, keep original href
+                if (
+                    hrefValue.startsWith("javascript:") ||
+                    hrefValue.startsWith("mailto:") ||
+                    hrefValue.startsWith("#")
+                ) return match;
+                return `href="${new URL(hrefValue, baseUrl).href}"`;
+            } catch {
                 return match;
             }
         });
     }
 
-    // Collapse multiple blank lines or extra whitespace
     return html.replace(/\n\s*\n/g, "\n").trim();
 }
 
+// ─── Event hash ───────────────────────────────────────────────────────────────
+
 /**
- * Generate unique SHA-256 hash for incoming webhook event.
- * Used at the controller level to discard duplicate webhooks instantly.
+ * Generate SHA-256 hash for incoming webhook event (L1 deduplication key).
  */
 export function buildEventHash(watchUuid, changeDatetime, diffAdded = "") {
     const rawString = `${watchUuid || ""}|${changeDatetime || ""}|${diffAdded || ""}`;
     return crypto.createHash("sha256").update(rawString).digest("hex");
 }
 
+// ─── Secret stripping ─────────────────────────────────────────────────────────
+
 /**
- * Remove secret key from payload before saving to Database or BullMQ queue.
- * Keeps system credentials safe in logs and DB records.
+ * Remove secret key from payload before saving to DB or BullMQ.
  */
 export function stripSecretFromPayload(payload) {
     if (!payload || typeof payload !== "object") return {};
     const { secret, ...safePayload } = payload;
     return safePayload;
 }
-function buildPrompt(payload) {
+
+// ─── Pass 1 prompt ────────────────────────────────────────────────────────────
+
+function buildPrompt(payload, recentDocs = []) {
     const {
         watch_uuid,
         watch_title,
@@ -77,11 +168,21 @@ function buildPrompt(payload) {
         diff,
         diff_added,
         diff_removed,
-        triggered_text
     } = payload;
-    console.log('diff_added----', diff_added);
-    return `
 
+    const recentContext = recentDocs.length > 0
+        ? `==================================================
+RECENT NOTIFICATIONS FROM THIS SOURCE (last ${recentDocs.length})
+Use these to detect near-duplicates and determine new_or_updated status.
+==================================================
+${recentDocs.map(d =>
+            `- title: "${d.title}" | date: ${d.notification_date || "unknown"} | category: ${d.category}`
+        ).join("\n")}
+
+`
+        : "";
+
+    return `
     You are the content extraction engine for "Rojgaar Suchna", a platform that monitors official Indian government websites for recruitment, examination, admission, and other candidate-related notifications.
 
     Your job is to analyze a detected website change and determine whether it contains one or more genuine, publishable recruitment-related notifications.
@@ -111,7 +212,7 @@ function buildPrompt(payload) {
     FALLBACK INPUT (Use ONLY when PRIMARY INPUT is empty):
     ${diff}
 
-   ==================================================
+    ${recentContext}==================================================
     GENERAL RULES
     ==================================================
 
@@ -163,61 +264,25 @@ function buildPrompt(payload) {
 
     Relevant examples include:
 
-    - Job
-    - Job Vacancy
-    - Recruitment Advertisement
-    - Result
-    - Admit Card
+    - Job / Job Vacancy / Recruitment Advertisement
+    - Result / Merit List / Cut Off
+    - Admit Card / Call Letter
     - Answer Key
-    - Admission
-    - Syllabus
-    - Exam Schedule
-    - Interview Schedule
-    - Document Verification
-    - Medical Examination
-    - PET
-    - CBT
-    - Merit List
-    - Cut Off
-    - Shortlist
-    - Application Status
-    - City Intimation
-    - Call Letter
-    - Corrigendum
-    - Scholarship
-    - Tender
+    - Admission / Counselling
+    - Syllabus / Exam Schedule
+    - Interview Schedule / Document Verification / Medical Examination
+    - PET / CBT / Shortlist / Application Status / City Intimation
+    - Corrigendum / Scholarship / Tender
 
     Ignore completely if the change is only:
 
-    - Visitor counter
-    - IP address
-    - Server name
-    - Captcha
-    - Accessibility text
-    - Footer
-    - Copyright
-    - CSS
-    - JavaScript
-    - HTML fragments
-    - Logo
-    - Banner
-    - Image
-    - Menu
-    - Breadcrumb
-    - Contact information
-    - Social links
-    - Formatting changes
-    - Whitespace changes
-    - Table reordering
-    - Duplicate unchanged content
+    - Visitor counter / IP address / Server name / Captcha
+    - Accessibility text / Footer / Copyright / CSS / JavaScript
+    - HTML fragments / Logo / Banner / Image / Menu / Breadcrumb
+    - Contact information / Social links / Formatting changes
+    - Whitespace changes / Table reordering / Duplicate unchanged content
     - Commercial advertisements
-    - Generic buttons such as:
-    - Click Here
-    - Download
-    - Login
-    - View
-    - PDF
-
+    - Generic buttons such as: Click Here, Download, Login, View, PDF
     unless surrounding text clearly identifies an actual recruitment notification.
 
     If the provided text is obviously truncated or incomplete and reliable extraction is impossible, never guess the missing information.
@@ -238,7 +303,7 @@ function buildPrompt(payload) {
     {
     "relevant": true,
     "publish": true,
-    "watch_uuid": "{{watch_uuid}}",
+    "watch_uuid": "${watch_uuid}",
     "items": [
         {
         "title": "",
@@ -252,10 +317,32 @@ function buildPrompt(payload) {
         "notification_date": "",
         "new_or_updated": "",
         "confidence": 0,
-        "raw_explanation": ""
+        "raw_explanation": "",
+        "pdf_url": null,
+        "pdf_needs_backend_fetch": false,
+        "is_duplicate": false
         }
     ]
     }
+
+    ==================================================
+    PDF FIELDS — IMPORTANT
+    ==================================================
+
+    pdf_url:
+    - If the notification has a direct link to an official PDF document visible in diff_added, set this to the full absolute URL.
+    - If the link is relative (e.g. /pdf/notice.pdf), resolve it against the Website URL above to form the full URL.
+    - If no PDF link is visible, set to null.
+    - Do NOT invent PDF URLs. Only use links explicitly visible in the content.
+
+    pdf_needs_backend_fetch:
+    - Set to true ONLY when pdf_url is non-null AND the backend should download and extract the PDF text for deeper analysis.
+    - If pdf_url is null, set to false.
+    - If the PDF content is already fully captured in the diff text, set to false.
+
+    is_duplicate:
+    - Set to true if this notification appears to already exist in the RECENT NOTIFICATIONS list above (same title, date, and category).
+    - Set to false otherwise.
 
     ==================================================
     MULTIPLE NOTIFICATIONS
@@ -263,382 +350,138 @@ function buildPrompt(payload) {
 
     Return ONE object inside "items" for EACH distinct notification.
 
-    Examples:
-
-    Correct:
-
-    Answer Key
-    Call Letter
-    Result
-
-    ↓
-
-    Three separate items.
-
     Do NOT merge unrelated notifications.
-
-    However, language variants of the SAME notification (English, Hindi, Marathi, Tamil, etc.) must be treated as ONE notification.
-
-    If uncertain whether two pieces represent different notifications, prefer separate items.
-
+    Language variants of the SAME notification (English, Hindi, Marathi, Tamil) = ONE notification.
     Never create an item for content that appears only in diff_removed.
 
-    Example
-
-    diff_added:
-    + CEN 05/2025 Answer Key
-
-    diff_removed:
-    + CEN 09/2025 Application Status
-    + CEN 04/2025 Document Verification
-
-    Correct Output:
-    1 item
-
-    CEN 05/2025
-
-    Incorrect Output:
-    3 items
     ==================================================
     FIELD RULES
     ==================================================
-    title
-
-    Generate a human-friendly, SEO-friendly title that accurately describes the notification.
-
-    Purpose:
-    - This is the primary title shown to users.
-    - This title will also be used to generate the page slug.
-    - It should match how people naturally search on Google.
-    - Prefer readability over copying the official title word-for-word.
-
-    Rules:
-    - Preserve all important identifying information.
-    - Keep official identifiers whenever they uniquely identify the notification (CEN, Advertisement No., Notification No., Recruitment No., etc.).
-    - Include the organization or recruiting body when available.
-    - Include the examination, recruitment, post, scheme, or subject.
-    - Include the notification type (Notification, Recruitment, Result, Admit Card, Answer Key, Merit List, Syllabus, Vacancy, etc.).
-    - Include the year when explicitly available.
-    - Reorder words to improve readability.
-    - Remove redundant legal or administrative wording that does not help identify the notification.
-    - Remove phrases such as:
-    - Regarding...
-    - In reference to...
-    - Notice for...
-    - Result of...
-    - Held on...
-    - Dated...
-    - Computer Based Test
-    - Preliminary Examination
-    - Main Examination
-    - Written Examination
-    - Phase-I
-    - Stage-I
-    - Stage-II
-    - Subject to...
-    when they do not help users identify the notification.
-    - Never invent departments, posts, years, numbers, stages, or keywords.
-    - Never change official reference numbers.
-    - Keep the title concise (typically 40–80 characters).
-    - Write in Title Case.
-    - The same notification should always generate the same title.
-
-    Examples
-
-    Official:
-    Result of Stage-I Preliminary Examination (Computer Based Test) of Junior Judicial Assistant / Restorer (Open) Examination – 2026
-
-    Output:
-    Delhi High Court Junior Judicial Assistant Result 2026
-
-    Official:
-    CEN No. 02/2025 (NTPC) - Call Letter for Document Verification
-
-    Output:
-    RRB NTPC CEN 02/2025 Document Verification Call Letter
-
-    Official:
-    Notice regarding release of SSC GD Constable Examination Result 2026
-
-    Output:
-    SSC GD Constable Result 2026
-
-    Official:
-    Advertisement No. 05/2026 Recruitment of Assistant Engineer (Civil)
-
-    Output:
-    Assistant Engineer (Civil) Recruitment Advertisement No. 05/2026
-
-    Bad Examples:
-    - Latest Government Job
-    - New Notification
-    - Click Here
-    - Download PDF
-    - Important Notice
-    - Notification Regarding...
-----------------------------------
-    summary
-
-    Write 2–3 simple sentences describing:
-
-    - what has changed
-    - what candidates should do next
-
-    Do not exaggerate.
-
-    Do not add information not present.
-
-    ----------------------------------
-
-    source_url
-
-    Always use the provided Website URL exactly.
-
-    ----------------------------------
-
-    body
-
-    Use the Website Name.
-
-    Do not infer another organization from the page.
-
-    ----------------------------------
-
-    department
-
-    Only infer when obvious.
-
-    Example:
-
-    Railway Recruitment Board
-
-    ↓
-
-    Ministry of Railways
-
-    If uncertain, use the same value as body.
-
-    ----------------------------------
-
-    category
-
-    Must be EXACTLY one of:
-
-    Job
-    Result
-    Admit Card
-    Answer Key
-    Syllabus
-    Admission
-    Notice
-    Scholarship
-    Tender
-
-    Never create any other category name.
-
-    Use these deterministic mappings:
-
-    - recruitment and vacancy advertisements = Job
-    - merit list, shortlist, cut off, selected candidate, supplementary result, and application status = Result
-    - generic notices, corrigendum, OTR, and exam calendar = Notice
-    - scholarship announcements = Scholarship
-
-    Labels such as Merit List, Shortlist, Cut Off, Application Status, Corrigendum, and Recruitment Advertisement must appear only in notification_type, not in category.
-
-    ----------------------------------
-
-    original_title
-
-    Store the official title exactly as it appears on the source website.
-
-    Purpose:
-
-    Preserve the original wording published by the authority.
-    This is used for verification and source reference.
-    Users can search this exact text on the official page (Ctrl+F) and find the notification.
-    Do NOT rewrite, shorten, or optimize it.
-    Preserve capitalization, punctuation, reference numbers, abbreviations, stages, and examination names exactly.
-    Never translate.
-    Never remove words.
-    Never add words.
-    Never normalize spacing except trimming leading/trailing whitespace.
-    If multiple headings exist, use the primary notification heading.
-
-    Example
-
-    Official Page
-
-    Result of Stage-I Preliminary Examination (Computer Based Test) of Junior Judicial Assistant / Restorer (Open) Examination – 2026
-
-    Output
-
-    Result of Stage-I Preliminary Examination (Computer Based Test) of Junior Judicial Assistant / Restorer (Open) Examination – 2026
-    ----------------------------------
-
-    notification_type
-
-    Choose the most appropriate value.
-
-    Examples include:
-
-    Recruitment Advertisement
-    Result
-    Answer Key
-    Objection Notice
-    Call Letter
-    Interview Schedule
-    Exam Schedule
-    Application Status
-    Document Verification
-    Medical Examination
-    PET
-    CBT
-    City Intimation
-    Merit List
-    Cut Off
-    Shortlist
-    Corrigendum
-    Tender
-    Other
-
-    ----------------------------------
-
-    notification_date
-
-    Use the date explicitly stated.
-
-    Return as:
-
-    YYYY-MM-DD
-
-    If no notification date exists, use Detected At and mention this in raw_explanation.
-
-    ----------------------------------
-
-    new_or_updated
-
-    Return "New" only when the notification appears in diff_added and there is
-    no matching notification in diff_removed.
-
-    Return "Updated" only when:
-
-    1. The same notification appears in BOTH diff_added and diff_removed.
-    2. The content has materially changed
-    (title, date, status, PDF, result, notice, advertisement,
-    corrigendum, or notification text).
-
-    If the matching content is identical or nearly identical,
-    DO NOT classify it as Updated.
-
-    Instead, classify it as New and reduce confidence,
-    or mention in raw_explanation that the change could not be confirmed.
-
-    Never assume Updated solely because the notification
-    appears in both inputs.
-
-    Examples of Updated:
-
-    Old:
-    Result published on 10 July
-
-    New:
-    Result revised on 12 July
-
-    Old:
-    Admit Card Notice
-
-    New:
-    Revised Admit Card Notice
-
-    Examples of NOT Updated:
-
-    diff_added:
-    CEN 05/2025
-
-    diff_removed:
-    CEN 09/2025
-
-    Result:
-    CEN 05/2025 = New
-
-    Ignore CEN 09/2025 completely.
-
-    ----------------------------------
-
-    confidence
-
-    95–100
-
-    Official notification with complete and unambiguous information.
-
-    80–94
-
-    Clearly relevant with minor inference.
-
-    60–79
-
-    Relevant but partially incomplete or ambiguous.
-
-    Below 60
-
-    Uncertain.
-    Requires manual review.
-
-    ----------------------------------
-
-    raw_explanation
-
-    Internal note only.
-
-    Explain:
-
-    - any inference made
-    - whether notification_date came from Detected At
-    - why confidence was reduced
-    - whether content was partially truncated
-
-    Keep it concise.
+    title — Human-friendly SEO title (40–80 chars, Title Case)
+    original_title — Exact official title, no rewording
+    summary — 2–3 sentences: what changed + what candidates should do next
+    source_url — Exactly the Website URL provided above
+    body — Recruiting organization name (1-2 sentences)
+    department — Ministry/department (infer only when obvious)
+    category — EXACTLY one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender
+    notification_type — e.g. Recruitment Advertisement, Result, Answer Key, Corrigendum, etc.
+    notification_date — YYYY-MM-DD (use Detected At if no explicit date; note this in raw_explanation)
+    new_or_updated — "New" or "Updated"
+    confidence — 0-100 (95+ = complete official info; below 60 = needs review)
+    raw_explanation — Brief internal note on any inference or uncertainty
 
     ==================================================
     FINAL RULES
     ==================================================
 
-    - Never fabricate facts.
-    - Never invent dates.
-    - Never invent notification numbers.
-    - Never merge unrelated notifications.
-    - Never discard a valid notification because another one appears more important.
-    - Preserve official titles whenever possible.
-    - Category must be exactly one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender.
-    - Never create new category names.
-    - Return ONLY valid JSON.
-    ==================================================
-    MOST IMPORTANT RULE
-    ==================================================
-
-    A notification MUST originate from diff_added.
-
-    If a notification is not present in diff_added, it MUST NOT appear in the output.
-
-    The only exception is when diff_added is empty, in which case use diff.
-    `
+    - Never fabricate facts, dates, or notification numbers.
+    - Category must be exactly one of the allowed values above.
+    - Return ONLY valid JSON. No prose. No markdown code fences.
+    - A notification MUST originate from diff_added.
+    `;
 }
+
+// ─── Pass 2 prompt ────────────────────────────────────────────────────────────
+
+function buildPass2Prompt(pass1Item, pdfText) {
+    return `
+You are the content refinement engine and blog writer for "Rojgaar Suchna".
+We have already extracted preliminary notification data from a website change (Pass 1).
+Now, we have extracted the FULL TEXT of the official PDF document related to this notification.
+
+==================================================
+PASS 1 EXTRACTED ITEM (Reference only — do NOT blindly copy these values)
+==================================================
+${JSON.stringify(pass1Item, null, 2)}
+
+==================================================
+OFFICIAL PDF CONTENT (AUTHORITATIVE — single source of truth)
+==================================================
+${pdfText.slice(0, PDF_TEXT_LIMIT)}
+
+==================================================
+INSTRUCTIONS
+==================================================
+1. Treat the OFFICIAL PDF CONTENT as the single source of truth.
+2. Refine ALL fields (title, summary, department, body, category, notification_type, notification_date) from the official PDF text.
+3. Do NOT hardcode or blindly copy category/notification_type from Pass 1. Re-evaluate them independently from the PDF content.
+4. Keep the category strictly one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender.
+5. Also generate a complete human-friendly SEO-optimized blog article in the "markdown_body" field.
+6. The markdown_body MUST be in PURE MARKDOWN format ONLY. Do NOT use any HTML tags.
+7. Return ONLY valid JSON in the exact format below. No prose, no markdown code fences.
+
+==================================================
+JSON OUTPUT FORMAT
+==================================================
+{
+    "title": "Refined SEO Title Case Title from PDF",
+    "original_title": "${pass1Item.original_title || ""}",
+    "summary": "Updated 2-3 sentence summary from PDF...",
+    "source_url": "${pass1Item.source_url || ""}",
+    "pdf_url": "${pass1Item.pdf_url || ""}",
+    "department": "Ministry/Department Name as stated in PDF",
+    "body": "Recruiting organization name (1-2 sentences from PDF)",
+    "category": "",
+    "notification_type": "",
+    "notification_date": "YYYY-MM-DD",
+    "new_or_updated": "${pass1Item.new_or_updated || "New"}",
+    "confidence": 95,
+    "raw_explanation": "Refined using Pass 2 PDF. Category determined from PDF content.",
+    "markdown_body": "Exact Output Structure (copy this format): # SEO Title (55 chars max, keyword front-loaded) Meta Description (155 chars max, keyword + CTA) ### Short Introduction (100 words max) ### 📅 Important Dates | Event | Date | |-------|------| | ... | ... | ### 💼 Vacancy Details - List posts, expected vacancies - Education table ### 👤 Eligibility Criteria Numbered requirements + quick checklist ### 📊 Age Limit Table | Post | Age | Birth Range | ### 💰 Application Fee Details + payment methods ### 🧭 Selection Process 3 stages with bullets ### 💵 Salary & Benefits Year-wise breakdown ### 📝 How to Apply (7 Steps) 1. Visit joinindianarmy.nic.in ... ### 📂 Required Documents Bullet list with file specs ### ✅ Why Apply Now? 5 bullet benefits ### 🧠 Preparation Tips 6 numbered tips ### ❓ FAQs (6 Questions) Q1: [Question] A: [Answer] ### 🎯 Final Call-to-Action Urgent CTA + official links"
+}
+
+CRITICAL RULES FOR markdown_body:
+- Use ONLY Markdown syntax. NEVER use HTML tags.
+- Tables MUST use Markdown format: | Column | Column |
+- Lists MUST use: - item  OR  1. item
+- Headings MUST use: ### Heading
+- Write in simple English for Tier-2/3 city readers across India.
+- Short sentences (under 20 words). Max 3 lines per paragraph.
+- Active, friendly, urgent tone.
+- Use ONLY facts from the official PDF. Never invent dates, fees, vacancies, or links.
+`;
+}
+
+// ─── PDF download ─────────────────────────────────────────────────────────────
 
 /**
  * Safely download a PDF file and extract plain text content.
+ * Resolves relative URLs, checks content-type, bounds size and text length.
  * Returns { success: true, text } or { success: false, error }.
  */
-export async function downloadAndExtractPdfText(pdfUrl) {
+export async function downloadAndExtractPdfText(pdfUrl, watchUrl = "") {
     try {
-        console.log(`📥 [PDF Fetch] Downloading PDF from: ${pdfUrl}`);
-        const response = await axios.get(pdfUrl, {
+        // Resolve relative URLs
+        let resolvedUrl = pdfUrl;
+        if (watchUrl && !pdfUrl.startsWith("http://") && !pdfUrl.startsWith("https://")) {
+            try {
+                resolvedUrl = new URL(pdfUrl, watchUrl).href;
+                console.log(`🔗 [PDF] Resolved relative URL: ${pdfUrl} → ${resolvedUrl}`);
+            } catch {
+                console.warn(`⚠️ [PDF] Could not resolve relative URL: ${pdfUrl}`);
+            }
+        }
+
+        console.log(`📥 [PDF] Downloading: ${resolvedUrl}`);
+        const response = await axios.get(resolvedUrl, {
             responseType: "arraybuffer",
-            timeout: 15000, // 15 seconds timeout
-            maxContentLength: 10 * 1024 * 1024, // Maximum 10MB file size limit
+            timeout: PDF_TIMEOUT_MS,
+            maxContentLength: PDF_MAX_BYTES,
             headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RojgaarSuchnaBot/3.0",
+                "User-Agent": "Mozilla/5.0 RojgaarSuchnaBot/3.0",
             },
+            validateStatus: (status) => status >= 200 && status < 300,
         });
+
+        // Content-type check
+        const contentType = (response.headers["content-type"] || "").toLowerCase();
+        const validTypes = ["application/pdf", "application/octet-stream", "binary/octet-stream"];
+        if (!validTypes.some((t) => contentType.startsWith(t))) {
+            return {
+                success: false,
+                error: `Unexpected content-type: ${contentType} (expected PDF)`,
+            };
+        }
 
         const buffer = Buffer.from(response.data);
         const pdfModule = await import("pdf-parse");
@@ -647,66 +490,23 @@ export async function downloadAndExtractPdfText(pdfUrl) {
         const extractedText = (parsed.text || "").trim();
 
         if (!extractedText) {
-            return { success: false, error: "Extracted PDF text is empty (scanned image PDF)" };
+            return { success: false, error: "Extracted PDF text is empty (scanned image PDF or no text layer)" };
         }
 
-        console.log(`✅ [PDF Fetch] Successfully extracted ${extractedText.length} characters from PDF.`);
+        console.log(`✅ [PDF] Extracted ${extractedText.length} chars from PDF.`);
         return { success: true, text: extractedText };
     } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        console.error(`⚠️ [PDF Fetch Warning] Failed to download or parse PDF (${pdfUrl}): ${errorMsg}`);
+        console.error(`⚠️ [PDF] Failed to download/parse PDF (${pdfUrl}): ${errorMsg}`);
         return { success: false, error: errorMsg };
     }
 }
 
-/**
- * Build Pass 2 AI Prompt when PDF text is available.
- * PDF content is treated as authoritative over webpage metadata.
- */
-function buildPass2Prompt(pass1Item, pdfText) {
-    return `
-You are the content refinement engine for "Rojgaar Suchna".
-We have already extracted preliminary notification data from a website change (Pass 1).
-Now, we have extracted the FULL TEXT of the official PDF document related to this notification.
-
-==================================================
-PASS 1 EXTRACTED ITEM
-==================================================
-${JSON.stringify(pass1Item, null, 2)}
-
-==================================================
-OFFICIAL PDF CONTENT (AUTHORITATIVE)
-==================================================
-${pdfText.slice(0, 15000)}
-
-==================================================
-INSTRUCTIONS
-==================================================
-1. Treat the OFFICIAL PDF CONTENT as authoritative.
-2. Refine the title, summary, department, body, and notification_date based on the official PDF text.
-3. Keep the category strictly one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender.
-4. Return ONLY valid JSON in the exact same format:
-
-{
-    "title": "Refined Title Case Title",
-    "original_title": "${pass1Item.original_title || ""}",
-    "summary": "Updated summary from PDF...",
-    "source_url": "${pass1Item.source_url || ""}",
-    "department": "Ministry/Department Name",
-    "body": "Detailed notification body",
-    "category": "${pass1Item.category || "Job"}",
-    "notification_type": "${pass1Item.notification_type || "Recruitment Advertisement"}",
-    "notification_date": "YYYY-MM-DD",
-    "new_or_updated": "${pass1Item.new_or_updated || "New"}",
-    "confidence": 95,
-    "raw_explanation": "Refined using Pass 2 PDF text extraction."
-}
-`;
-}
+// ─── safeToPublish ────────────────────────────────────────────────────────────
 
 /**
  * Strict safety guard before publishing any notification.
- * Returns true if notification meets all quality & confidence criteria.
+ * Returns true only if notification meets all quality & confidence criteria.
  */
 export function safeToPublish(item) {
     if (!item) return false;
@@ -715,8 +515,12 @@ export function safeToPublish(item) {
     if (item.pdf_download_failed === true) return false;
     if (typeof item.confidence === "number" && item.confidence < 70) return false;
     if (!item.title || !item.category || !item.source_url) return false;
+    // Require a non-empty markdown_body to ensure the blog article is present
+    if (!item.markdown_body || item.markdown_body.trim().length < 50) return false;
     return true;
 }
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function generateHash(item, watch_uuid) {
     return crypto
@@ -745,120 +549,235 @@ function normalizeNotificationItem(item) {
     };
 }
 
+// ─── Core pipeline ────────────────────────────────────────────────────────────
+
 /**
  * Core V3 Webhook Processing Engine (2-Pass Adaptive AI Pipeline).
+ *
+ * Receives job.data from BullMQ which includes:
+ *   - all webhook payload fields (watch_uuid, diff_added, etc.)
+ *   - rawEventId: string — the MongoDB _id of the corresponding RawEvent
+ *
+ * Throws on actual failures so BullMQ can retry.
+ * Returns normally for expected non-error outcomes (irrelevant, duplicate).
  */
-export const processJob = async (payload) => {
+export const processJob = async (jobData) => {
+    const { rawEventId, ...payload } = jobData;
+
+    /**
+     * Helper to update RawEvent status without crashing the pipeline.
+     * A status update failure should never abort processing.
+     */
+    const setStatus = async (status, extra = {}) => {
+        if (!rawEventId) return;
+        try {
+            await updateRawEventStatus(rawEventId, status, extra);
+        } catch (err) {
+            console.warn(`⚠️ [RawEvent] Status update to "${status}" failed: ${err.message}`);
+        }
+    };
+
     try {
-        console.log(`🚀 [V3 Pipeline] Processing job for Watch: ${payload.watch_title || payload.watch_uuid}`);
+        console.log(`🚀 [V3 Pipeline] Processing for Watch: ${payload.watch_title || payload.watch_uuid}`);
 
-        // Step 1: Clean HTML snapshot if provided to optimize AI context
+        // ── Step 1: Clean HTML ──────────────────────────────────────────────
         const cleanedHtml = cleanHtmlSnapshot(payload.snapshot_html || payload.html, payload.watch_url);
-        const enrichedPayload = {
-            ...payload,
-            snapshot_html: cleanedHtml,
-        };
+        const enrichedPayload = { ...payload, snapshot_html: cleanedHtml };
 
-        // Step 2: Pass 1 AI Analysis (Webpage change + HTML analysis)
-        const promptPass1 = buildPrompt(enrichedPayload);
+        // ── Step 1b: DB context — recent notifications for this watch ───────
+        let recentDocs = [];
+        try {
+            recentDocs = await LatestNotification
+                .find({ watch_uuid: payload.watch_uuid })
+                .select("title original_title category notification_date dedupe_hash")
+                .sort({ createdAt: -1 })
+                .limit(20)
+                .lean();
+            console.log(`📚 [DB Context] ${recentDocs.length} recent notifications for watch: ${payload.watch_uuid}`);
+        } catch (dbErr) {
+            console.warn(`⚠️ [DB Context] Could not fetch recent docs: ${dbErr.message}`);
+        }
+
+        // ── Step 2: Pass 1 AI ───────────────────────────────────────────────
+        await setStatus(PIPELINE_STATUS.AI_PROCESSING, { status_note: "Pass 1 AI started" });
+
+        const promptPass1 = buildPrompt(enrichedPayload, recentDocs);
         const modelName = getTextModel();
-        
-        console.log(`🤖 [Pass 1 AI] Sending prompt using model: ${modelName}`);
-        const pass1Result = await callTextLlm(promptPass1, modelName);
-        
+        console.log(`🤖 [Pass 1] Calling AI model: ${modelName}`);
+
+        let pass1Raw;
+        try {
+            const pass1Result = await callTextLlm(promptPass1, modelName);
+            pass1Raw = pass1Result.raw || "";
+        } catch (aiErr) {
+            await setStatus(PIPELINE_STATUS.AI_FAILED, {
+                status_note: `Pass 1 AI error: ${aiErr.message}`,
+                "ai.last_error": aiErr.message.slice(0, 500),
+            });
+            throw new Error(`Pass 1 AI failed: ${aiErr.message}`);
+        }
+
+        // ── Step 3: Parse + Zod-validate Pass 1 response ───────────────────
         let data;
         try {
-            // Clean markdown blocks if present in raw response
-            const cleanedRaw = (pass1Result.raw || "")
-                .replace(/```json/gi, "")
-                .replace(/```/g, "")
-                .trim();
-            data = JSON.parse(cleanedRaw);
-        } catch (jsonErr) {
-            console.error(`❌ [JSON Parse Error] AI response was not valid JSON: ${pass1Result.raw}`);
-            throw new Error(`AI returned invalid JSON: ${jsonErr.message}`);
-        }
-
-        // Step 3: Fast exit if change is noise or irrelevant
-        if (!data || !data.relevant || !Array.isArray(data.items) || data.items.length === 0) {
-            console.log(`ℹ️ [V3 Pipeline] Event ignored. Reason: ${data?.reason || "Not relevant recruitment change"}`);
-            return { processed: true, relevant: false, reason: data?.reason };
-        }
-
-        console.log(`📌 [Pass 1 AI] Found ${data.items.length} potential notification(s).`);
-
-        // Step 4: Process each notification item (Pass 2 PDF Fallback & Publishing)
-        for (let item of data.items) {
-            // Check if PDF url exists and backend fetch is required
-            if (item.pdf_url && item.pdf_needs_backend_fetch) {
-                console.log(`📄 [PDF Fallback] Item requires backend PDF extraction: ${item.pdf_url}`);
-                const pdfResult = await downloadAndExtractPdfText(item.pdf_url);
-
-                if (pdfResult.success) {
-                    // Pass 2 AI call to refine content using official PDF text
-                    const promptPass2 = buildPass2Prompt(item, pdfResult.text);
-                    console.log(`🤖 [Pass 2 AI] Refining item with official PDF content...`);
-                    const pass2Response = await callTextLlm(promptPass2, modelName);
-                    
-                    try {
-                        const cleanedPass2Raw = (pass2Response.raw || "")
-                            .replace(/```json/gi, "")
-                            .replace(/```/g, "")
-                            .trim();
-                        const pass2RefinedItem = JSON.parse(cleanedPass2Raw);
-                        
-                        // Merge Pass 2 refinements into item
-                        item = {
-                            ...item,
-                            ...pass2RefinedItem,
-                            pdf_url: item.pdf_url, // keep original PDF link
-                        };
-                        console.log(`✨ [Pass 2 AI] Item successfully refined using official PDF!`);
-                    } catch (p2Err) {
-                        console.warn(`⚠️ [Pass 2 Warning] Could not parse Pass 2 JSON response, falling back to Pass 1 item.`);
-                    }
-                } else {
-                    // PDF download/parsing failed: mark for review instead of publishing incomplete blog
-                    item.pdf_download_failed = true;
-                    item.confidence = Math.min(item.confidence || 50, 55);
-                    item.raw_explanation = `${item.raw_explanation || ""} [PDF Download Failed: ${pdfResult.error}]`.trim();
-                }
+            const jsonStr = extractJsonFromText(pass1Raw);
+            if (!jsonStr) throw new Error("No JSON object found in Pass 1 AI response");
+            const parsed = JSON.parse(jsonStr);
+            const validation = Pass1ResponseSchema.safeParse(parsed);
+            if (!validation.success) {
+                const issuesSummary = validation.error.issues
+                    .map((i) => `${i.path.join(".")}: ${i.message}`)
+                    .join("; ");
+                throw new Error(`Pass 1 Zod validation failed: ${issuesSummary}`);
             }
+            data = validation.data;
+        } catch (parseErr) {
+            await setStatus(PIPELINE_STATUS.AI_FAILED, {
+                status_note: `Pass 1 parse/validation error: ${parseErr.message}`,
+            });
+            throw new Error(`Pass 1 response invalid: ${parseErr.message}`);
+        }
 
-            // Step 5: Normalize category & build deduplication hash
-            const normalizedItem = normalizeNotificationItem(item);
-            const dedupeHash = generateHash(normalizedItem, data.watch_uuid);
+        // ── Step 4: Fast exit if irrelevant ─────────────────────────────────
+        if (!data.relevant || !Array.isArray(data.items) || data.items.length === 0) {
+            const reason = data.reason || "Not a relevant recruitment change";
+            console.log(`ℹ️ [V3 Pipeline] Irrelevant. Reason: ${reason}`);
+            await setStatus(PIPELINE_STATUS.REJECTED, {
+                status_note: `Irrelevant: ${reason}`,
+                "ai.pass1_relevant": false,
+                "ai.model": modelName,
+            });
+            return { processed: true, relevant: false, reason };
+        }
 
-            // Step 6: Deduplication Check in Database
-            const existingNotification = await LatestNotification.findOne({ dedupe_hash: dedupeHash });
-            if (existingNotification) {
-                console.log(`🔁 [Deduplication] Notification already exists in DB: "${normalizedItem.title}"`);
-                normalizedItem.is_duplicate = true;
+        console.log(`📌 [Pass 1] Found ${data.items.length} notification(s).`);
+
+        // Update RawEvent with Pass 1 meta
+        await setStatus(PIPELINE_STATUS.MATCHED, {
+            status_note: `Pass 1 found ${data.items.length} item(s)`,
+            "ai.pass1_relevant": true,
+            "ai.pass1_item_count": data.items.length,
+            "ai.model": modelName,
+        });
+
+        const publishedItems = [];
+
+        // ── Step 5: Process each item ────────────────────────────────────────
+        for (let item of data.items) {
+            // Skip AI-flagged duplicates (via DB context comparison)
+            if (item.is_duplicate === true) {
+                console.log(`🔁 [AI Duplicate] Skipping AI-identified duplicate: "${item.title}"`);
                 continue;
             }
 
-            // Step 7: Check safeToPublish guard
+            let pdfAttempted = false;
+            let pdfSuccess = false;
+
+            // ── PDF path ────────────────────────────────────────────────────
+            if (item.pdf_url && item.pdf_needs_backend_fetch) {
+                pdfAttempted = true;
+                console.log(`📄 [PDF] Backend fetch required: ${item.pdf_url}`);
+                await setStatus(PIPELINE_STATUS.TEXT_EXTRACTING, {
+                    status_note: `PDF download started: ${item.pdf_url}`,
+                });
+
+                const pdfResult = await downloadAndExtractPdfText(item.pdf_url, payload.watch_url);
+
+                if (pdfResult.success) {
+                    pdfSuccess = true;
+
+                    // Pass 2 AI — refine item + generate markdown_body from PDF
+                    const promptPass2 = buildPass2Prompt(item, pdfResult.text);
+                    console.log(`🤖 [Pass 2] Refining item with official PDF content...`);
+
+                    try {
+                        const pass2Result = await callTextLlm(promptPass2, modelName);
+                        const rawText2 = pass2Result.raw || "";
+                        const jsonStr2 = extractJsonFromText(rawText2);
+                        if (!jsonStr2) throw new Error("No JSON in Pass 2 AI response");
+                        const parsed2 = JSON.parse(jsonStr2);
+                        const v2 = Pass2ItemSchema.safeParse(parsed2);
+                        if (!v2.success) {
+                            const issues = v2.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+                            throw new Error(`Pass 2 Zod validation failed: ${issues}`);
+                        }
+                        // Merge: PDF is authoritative; preserve original pdf_url
+                        item = { ...item, ...v2.data, pdf_url: item.pdf_url };
+                        console.log(`✨ [Pass 2] Item refined with official PDF.`);
+                    } catch (p2Err) {
+                        // Pass 2 failure: keep Pass 1 item, mark for review
+                        console.warn(`⚠️ [Pass 2] Failed: ${p2Err.message}. Falling back to Pass 1 item.`);
+                        item.raw_explanation = `${item.raw_explanation || ""} [Pass2 failed: ${p2Err.message}]`.trim();
+                        item.confidence = Math.min(item.confidence || 50, 60);
+                        item.pdf_download_failed = true; // → pending_review
+                    }
+                } else {
+                    // PDF download/parse failed
+                    item.pdf_download_failed = true;
+                    item.confidence = Math.min(item.confidence || 50, 55);
+                    item.raw_explanation = `${item.raw_explanation || ""} [PDF Download Failed: ${pdfResult.error}]`.trim();
+                    console.warn(`⚠️ [PDF] Download failed for item "${item.title}": ${pdfResult.error}`);
+                }
+            }
+
+            // ── Blog fallback — only when no Pass 2 markdown_body ──────────
+            // Run ONLY if markdown_body is missing/too short AND pdf path was not taken or failed
+            //  this is use less that is why i have commented  leter i wil remove it
+            // if (!item.markdown_body || item.markdown_body.trim().length < 50) {
+            //     console.log(`📝 [Blog Fallback] markdown_body missing — generating via createAIBlog...`);
+            //     try {
+            //         const fallbackText = (
+            //             payload.diff_added ||
+            //             payload.snapshot_html ||
+            //             payload.diff ||
+            //             ""
+            //         ).slice(0, 12000);
+            //         if (fallbackText.trim()) {
+            //             const blogContent = await createAIBlog(fallbackText);
+            //             if (blogContent && blogContent.trim().length >= 50) {
+            //                 item.markdown_body = blogContent;
+            //                 console.log(`✅ [Blog Fallback] markdown_body generated successfully.`);
+            //             }
+            //         }
+            //     } catch (blogErr) {
+            //         console.warn(`⚠️ [Blog Fallback] createAIBlog failed: ${blogErr.message}`);
+            //     }
+            // }
+
+            // ── Normalize category & generate L2 dedup hash ─────────────────
+            const normalizedItem = normalizeNotificationItem(item);
+            const dedupeHash = generateHash(normalizedItem, data.watch_uuid || payload.watch_uuid);
+
+            // ── L2 Atomic deduplication ──────────────────────────────────────
+            // Use findOneAndUpdate + $setOnInsert for atomic insert.
+            // If the document already exists, result.lastErrorObject.updatedExisting = true.
+            const rawDate = normalizedItem.notification_date;
+            const parsedDate = rawDate ? Date.parse(rawDate) : NaN;
+            const validNotificationDate = !isNaN(parsedDate) ? new Date(parsedDate) : new Date();
+
             const isPublishable = safeToPublish(normalizedItem);
             const baseSlug = buildSlug(normalizedItem);
             const slug = await generateUniqueSlug(baseSlug, LatestNotification);
 
-            // Step 8: Save to Database
-            const savedDoc = await LatestNotification.create({
-                watch_uuid: data.watch_uuid,
+            const notificationDoc = {
+                watch_uuid: data.watch_uuid || payload.watch_uuid,
+                source_event_id: rawEventId || undefined,
                 title: normalizedItem.title,
-                original_title: normalizedItem.original_title || item.original_title || normalizedItem.title,
+                original_title: normalizedItem.original_title || normalizedItem.title,
                 slug,
                 summary: normalizedItem.summary,
                 source_url: normalizedItem.source_url || payload.watch_url,
                 pdf_url: normalizedItem.pdf_url || null,
+                markdown_body: normalizedItem.markdown_body || null,
                 department: normalizedItem.department || payload.watch_title,
                 body: normalizedItem.body || normalizedItem.summary,
                 category: normalizedItem.category,
-                notification_type: normalizedItem.notification_type || "Notice",
-                notification_date: normalizedItem.notification_date || new Date().toISOString().split("T")[0],
+                notification_type: normalizedItem.notification_type || "Other",
+                notification_date: validNotificationDate,
+                notification_date_raw: rawDate || null,
                 new_or_updated: normalizedItem.new_or_updated || "New",
                 publish: isPublishable,
-                status: isPublishable ? "published" : "needs_review",
+                status: isPublishable ? "published" : "pending_review",
                 dedupe_hash: dedupeHash,
                 ai: {
                     confidence: normalizedItem.confidence || 80,
@@ -867,16 +786,78 @@ export const processJob = async (payload) => {
                 },
                 webhook_payload: payload,
                 ai_response: data,
-            });
+            };
 
-            console.log(`✅ [Database Saved] Notification stored with status "${savedDoc.status}": "${savedDoc.title}"`);
+            let savedDoc;
+            let isDuplicate = false;
+
+            try {
+                // Atomic upsert: $setOnInsert only executes on new insert
+                const result = await LatestNotification.findOneAndUpdate(
+                    { dedupe_hash: dedupeHash },
+                    { $setOnInsert: notificationDoc },
+                    {
+                        upsert: true,
+                        new: true,
+                        setDefaultsOnInsert: true,
+                        rawResult: true,
+                    }
+                );
+
+                // Detect whether this was an insert or an existing doc
+                isDuplicate = !result.lastErrorObject?.upserted;
+                savedDoc = result.value;
+
+                if (isDuplicate) {
+                    console.log(`🔁 [L2 Dedup] Notification already exists in DB: "${normalizedItem.title}"`);
+                } else {
+                    console.log(`✅ [DB] Notification stored (status="${notificationDoc.status}"): "${normalizedItem.title}"`);
+                }
+            } catch (dbErr) {
+                // E11000 = race-condition duplicate on the unique index — treat as duplicate, not error
+                if (dbErr.code === 11000) {
+                    isDuplicate = true;
+                    console.log(`🔁 [L2 Dedup] Race-condition duplicate caught (E11000): "${normalizedItem.title}"`);
+                } else {
+                    throw new Error(`Database write failed: ${dbErr.message}`);
+                }
+            }
+
+            if (!isDuplicate && savedDoc) {
+                publishedItems.push({
+                    id: savedDoc._id,
+                    title: savedDoc.title,
+                    status: savedDoc.status,
+                });
+            }
         }
 
-        return { processed: true, relevant: true };
+        // ── Step 6: Final RawEvent status update ────────────────────────────
+        if (publishedItems.length === 0) {
+            // All items were duplicates or skipped
+            await setStatus(PIPELINE_STATUS.DUPLICATE, {
+                status_note: "All extracted notifications already existed in DB",
+                "published.status": "duplicate",
+                "published.at": new Date(),
+                "ai.pdf_attempted": false,
+            });
+        } else {
+            const allPublished = publishedItems.every((i) => i.status === "published");
+            const finalStatus = allPublished ? PIPELINE_STATUS.PUBLISHED : PIPELINE_STATUS.PENDING_REVIEW;
+            await setStatus(finalStatus, {
+                status_note: `${publishedItems.length} notification(s) saved`,
+                "published.notification_ids": publishedItems.map((i) => i.id),
+                "published.status": finalStatus,
+                "published.at": new Date(),
+            });
+        }
+
+        return { processed: true, relevant: true, publishedCount: publishedItems.length };
+
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(`❌ [V3 Pipeline Error] AI Processing failed: ${message}`);
-        throw new Error(`AI processing failed: ${message}`);
+        console.error(`❌ [V3 Pipeline Error] ${message}`);
+        // Re-throw so BullMQ retries (attempt count increments)
+        throw new Error(`V3 pipeline failed: ${message}`);
     }
 };
-

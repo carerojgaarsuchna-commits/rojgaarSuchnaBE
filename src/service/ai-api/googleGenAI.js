@@ -7,14 +7,34 @@
  *   callGoogleVision(pdfBase64, textPrompt, model)       → { raw, latencyMs }
  *
  * Google GenAI accepts PDF inlineData natively — no image-per-page conversion needed.
+ * All calls are guarded by AI_TIMEOUT_MS to prevent worker slot exhaustion.
  */
 
 import { GoogleGenAI } from "@google/genai";
+
+const AI_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 30000;
 
 function getClient() {
   const apiKey = process.env.GOOGLE_API_KEY?.trim();
   if (!apiKey) throw new Error("GOOGLE_API_KEY is not configured");
   return new GoogleGenAI({ apiKey });
+}
+
+/**
+ * Race a promise against a hard deadline.
+ * Rejects with a descriptive error when time runs out.
+ */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`[AI Timeout] ${label} exceeded ${ms}ms deadline`)),
+      ms
+    );
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
 }
 
 /**
@@ -30,11 +50,17 @@ export async function callGoogleText(prompt, model, systemInstruction) {
 
   const config = systemInstruction ? { systemInstruction } : undefined;
 
-  const response = await ai.models.generateContent({
+  const generatePromise = ai.models.generateContent({
     model,
     ...(config && { config }),
     contents: prompt,
   });
+
+  const response = await withTimeout(
+    generatePromise,
+    AI_TIMEOUT_MS,
+    `callGoogleText(${model})`
+  );
 
   return {
     raw: response.text ?? "",
@@ -59,7 +85,7 @@ export async function callGoogleVision(pdfBase64, textPrompt, model, systemInstr
   // Without it the model ignores the schema and invents its own structure.
   const config = systemInstruction ? { systemInstruction } : undefined;
 
-  const response = await ai.models.generateContent({
+  const generatePromise = ai.models.generateContent({
     model,
     ...(config && { config }),
     contents: [
@@ -77,6 +103,12 @@ export async function callGoogleVision(pdfBase64, textPrompt, model, systemInstr
       },
     ],
   });
+
+  const response = await withTimeout(
+    generatePromise,
+    AI_TIMEOUT_MS,
+    `callGoogleVision(${model})`
+  );
 
   return {
     raw: response.text ?? "",

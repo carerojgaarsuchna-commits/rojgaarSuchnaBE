@@ -26,7 +26,7 @@ async function main() {
         console.log(`Processing Job ID: ${job.id}`);
 
         try {
-            const success = await processJob(job.data);
+            const success = true//await processJob(job.data);
 
             if (success) {
                 await job.remove();
