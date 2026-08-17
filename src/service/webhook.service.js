@@ -2,12 +2,19 @@ import { z } from "zod";
 import { callTextLlm, getTextModel } from "./ai-api/aiProvider.js";
 import crypto from "crypto";
 import axios from "axios";
+import { createRequire } from "module";
 import { LatestNotification } from "../models/LatestNotification.js";
 import { normalizeNotificationCategory } from "../utils/notificationCategory.js";
 import { buildSlug, generateUniqueSlug } from "../utils/helper.js";
 // import { createAIBlog } from "./latestJobsService.js";
 import { updateRawEventStatus } from "../services/pipeline/rawEvent.service.js";
 import { PIPELINE_STATUS } from "../constants/pipelineStatus.js";
+import { fetchWatchSnapshot } from "./changedetection.service.js";
+
+// pdf-parse is a CJS module — dynamic import() does not interop reliably in ESM.
+// createRequire is the standard Node.js fix for CJS packages in ESM files.
+const _require = createRequire(import.meta.url);
+const pdfParse = _require("pdf-parse").PDFParse; // v2.x exports object; callable is .PDFParse
 
 // ─── Env config ───────────────────────────────────────────────────────────────
 const PDF_TIMEOUT_MS = Number(process.env.PDF_TIMEOUT_MS) || 15000;
@@ -213,6 +220,9 @@ ${recentDocs.map(d =>
     FALLBACK INPUT (Use ONLY when PRIMARY INPUT is empty):
     ${diff}
 
+    HTML SNAPSHOT (Use ONLY to resolve PDF/document hrefs found in diff_added):
+    ${snapshot_html ? snapshot_html.slice(0, 20000) : "Not available"}
+
     ${recentContext}==================================================
     GENERAL RULES
     ==================================================
@@ -331,16 +341,32 @@ ${recentDocs.map(d =>
     ==================================================
 
     pdf_url:
-    - here if wbsite html ${snapshot_html} first you have to find the excet "diff_added" in the html.
-    - If the notification has a direct link to an official PDF document visible in diff_added, set this to the full absolute URL.
-    - If the link is relative (e.g. /pdf/notice.pdf (Note: Many goverment site not use .pdf for the pdf you have make sure about it)), resolve it against the Website URL above to form the full URL.
-    - If no PDF link is visible, set to null.
-    - Do NOT invent PDF URLs. Only use links explicitly visible in the content.
+    IMPORTANT CONTEXT: The HTML SNAPSHOT is text-only — all <a href="..."> attributes
+    are stripped by the monitoring system. You will see filenames and file sizes
+    (e.g. "14082026-864_0001.pdf File size: 961 kB") but NOT the full download URL.
+    This is expected — the backend will resolve the filename to a full URL automatically.
+
+    Rules:
+    - If a full https:// URL is explicitly visible in diff_added or the SNAPSHOT text:
+        → Use it directly as pdf_url.
+    - If you see attachment filenames OR an "Attachments" section with file names
+      (even without a full URL, even a relative path, or just a bare filename):
+        → Set pdf_url to the EXACT filename or path shown (e.g. "14082026-864_0001.pdf").
+        → The backend will fetch the source page HTML and resolve it to a full URL.
+    - If no filename, no URL, and no document signal is visible at all:
+        → Set pdf_url to null.
+    - Do NOT invent or construct URLs. Only use what is explicitly visible.
+
+    NOTE ON EXTENSIONS: Many government sites do NOT use .pdf extension.
+    Document links may end in .docx, .doc, .aspx, .php?id=123, or even a plain path
+    with no extension. Treat ANY file attachment listed in the content as a document,
+    regardless of file extension.
 
     pdf_needs_backend_fetch:
-    - Set to true ONLY when pdf_url is non-null AND the backend should download and extract the PDF text for deeper analysis.
-    - If pdf_url is null, set to false.
-    - If the PDF content is already fully captured in the diff text, set to false.
+    - Set to true whenever pdf_url is non-null (filename, partial path, or full URL).
+    - Set to false only when pdf_url is null.
+    - Do NOT set to false just because the URL is not a full http:// link — the backend
+      handles filename-to-URL resolution automatically.
 
     is_duplicate:
     - Set to true if this notification appears to already exist in the RECENT NOTIFICATIONS list above (same title, date, and category).
@@ -486,10 +512,16 @@ export async function downloadAndExtractPdfText(pdfUrl, watchUrl = "") {
         }
 
         const buffer = Buffer.from(response.data);
-        const pdfModule = await import("pdf-parse");
-        const pdfParse = pdfModule.default || pdfModule;
-        const parsed = await pdfParse(buffer);
-        const extractedText = (parsed.text || "").trim();
+
+        // pdf-parse v2 API: PDFParse is a class, not a direct callable.
+        const parser = new pdfParse({ data: buffer });
+        let extractedText = "";
+        try {
+            const parsed = await parser.getText();
+            extractedText = (parsed.text || "").trim();
+        } finally {
+            await parser.destroy(); // always release parser resources
+        }
 
         if (!extractedText) {
             return { success: false, error: "Extracted PDF text is empty (scanned image PDF or no text layer)" };
@@ -582,29 +614,53 @@ export const processJob = async (jobData) => {
     try {
         console.log(`🚀 [V3 Pipeline] Processing for Watch: ${payload.watch_title || payload.watch_uuid}`);
 
-        // ── Step 1: Clean HTML ──────────────────────────────────────────────
-        const cleanedHtml = cleanHtmlSnapshot(payload.snapshot_html || payload.html, payload.watch_url);
-        const enrichedPayload = { ...payload, snapshot_html: cleanedHtml };
+        // ── Step 1: 
 
-        // ── Step 1b: DB context — recent notifications for this watch ───────
+        // ── Step 1b + 1c: Parallel — DB context + ChangeDetection API snapshot fetch ──
+        // Both are best-effort: failures warn but never abort the pipeline.
         let recentDocs = [];
-        try {
-            recentDocs = await LatestNotification
-                .find({ watch_uuid: payload.watch_uuid })
-                .select("title original_title category notification_date dedupe_hash")
-                .sort({ createdAt: -1 })
-                .limit(20)
-                .lean();
-            console.log(`📚 [DB Context] ${recentDocs.length} recent notifications for watch: ${payload.watch_uuid}`);
-        } catch (dbErr) {
-            console.warn(`⚠️ [DB Context] Could not fetch recent docs: ${dbErr.message}`);
-        }
+        let liveHtml; // prefer payload HTML; CDIO fetch fills this in
+
+        await Promise.allSettled([
+            // 1b: recent notifications for this watch (near-duplicate detection)
+            (async () => {
+                try {
+                    recentDocs = await LatestNotification
+                        .find({ watch_uuid: payload.watch_uuid })
+                        .select("title original_title category notification_date dedupe_hash")
+                        .sort({ createdAt: -1 })
+                        .limit(20)
+                        .lean();
+                    console.log(`📚 [DB Context] ${recentDocs.length} recent notifications for watch: ${payload.watch_uuid}`);
+                } catch (dbErr) {
+                    console.warn(`⚠️ [DB Context] Could not fetch recent docs: ${dbErr.message}`);
+                }
+            })(),
+
+            // 1c: fetch latest HTML snapshot from ChangeDetection API
+            // This gives the AI real <a href> links so it can populate pdf_url.
+            // Skipped if payload already contains HTML (future-proof).
+            (async () => {
+                if (liveHtml) return; // payload had HTML — skip API call
+                const raw = await fetchWatchSnapshot(payload.watch_uuid);
+                if (raw) {
+                    liveHtml = cleanHtmlSnapshot(raw, payload.watch_url);
+                    console.log(`🌐 [CDIO] Cleaned snapshot: ${liveHtml.length} chars for watch: ${payload.watch_uuid}`);
+                }
+            })(),
+        ]);
+
+        const enrichedPayload = { ...payload, snapshot_html: liveHtml };
 
         // ── Step 2: Pass 1 AI ───────────────────────────────────────────────
-        await setStatus(PIPELINE_STATUS.AI_PROCESSING, { status_note: "Pass 1 AI started" });
-
+        // Build the prompt first so we can store it in the RawEvent for debugging.
         const promptPass1 = buildPrompt(enrichedPayload, recentDocs);
         const modelName = getTextModel();
+
+        await setStatus(PIPELINE_STATUS.AI_PROCESSING, {
+            status_note: "Pass 1 AI started",
+            "ai.prompt_pass1": promptPass1,   // full prompt stored for inspection
+        });
         console.log(`🤖 [Pass 1] Calling AI model: ${modelName}`);
 
         let pass1Raw;
@@ -664,6 +720,15 @@ export const processJob = async (jobData) => {
 
         const publishedItems = [];
 
+        // Job-level PDF tracking — OR-assigned inside the loop so any item that
+        // triggers the PDF path sets the flag for the whole job.
+        let jobPdfAttempted = false;
+        let jobPdfSuccess = false;
+
+        // Page HTML cache for Step 2.5 URL resolution.
+        // Fetched at most once per job — reused for all items that need it.
+        let resolvedPageHtml = null;
+
         // ── Step 5: Process each item ────────────────────────────────────────
         for (let item of data.items) {
             // Skip AI-flagged duplicates (via DB context comparison)
@@ -675,9 +740,56 @@ export const processJob = async (jobData) => {
             let pdfAttempted = false;
             let pdfSuccess = false;
 
+            // ── Step 2.5: Resolve filename → full URL ────────────────────────
+            // Pass 1 AI may return a bare filename as pdf_url (e.g. "14082026-864_0001.pdf")
+            // because the snapshot is text-only and hrefs are stripped.
+            // Fetch the source page HTML once per job and extract the matching href.
+            if (item.pdf_url && !item.pdf_url.startsWith("http") && item.pdf_needs_backend_fetch) {
+                const filename = item.pdf_url;
+                try {
+                    // Lazy-fetch and cache the source page HTML for this job
+                    if (!resolvedPageHtml && payload.watch_url) {
+                        const pageRes = await axios.get(payload.watch_url, {
+                            timeout: Number(process.env.PIPELINE_HTML_TIMEOUT_MS) || 4000,
+                            maxContentLength: 5 * 1024 * 1024,
+                            responseType: "text",
+                            headers: { "User-Agent": "Mozilla/5.0 RojgaarSuchnaBot/3.0" },
+                            validateStatus: (s) => s >= 200 && s < 300,
+                        });
+                        resolvedPageHtml = pageRes.data || "";
+                        console.log(`🔍 [URL Resolve] Fetched source page (${resolvedPageHtml.length} chars): ${payload.watch_url}`);
+                    }
+
+                    // Search page HTML for any href that ends with /filename.
+                    // Requiring '/' before the filename prevents substring matches
+                    // (e.g. matching '114082026-864.pdf' when looking for '14082026-864.pdf').
+                    const escaped = filename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    const hrefMatch = resolvedPageHtml.match(
+                        new RegExp(`href=["']([^"']*?/${escaped})(?=["'?#])`, "i")
+                    );
+                    const hrefPath = hrefMatch?.[1] ?? null;
+
+                    if (hrefPath) {
+                        item.pdf_url = new URL(hrefPath, payload.watch_url).href;
+                        console.log(`🔗 [URL Resolve] ${filename} → ${item.pdf_url}`);
+                    } else {
+                        // Href not found in page — clear so we don't attempt a broken download
+                        console.warn(`⚠️ [URL Resolve] href for "${filename}" not found in source page. Clearing pdf_url.`);
+                        item.pdf_url = null;
+                        item.pdf_needs_backend_fetch = false;
+                    }
+                } catch (resolveErr) {
+                    // Page fetch failed — clear to avoid a bad download attempt
+                    console.warn(`⚠️ [URL Resolve] Source page fetch failed: ${resolveErr.message}. Clearing pdf_url.`);
+                    item.pdf_url = null;
+                    item.pdf_needs_backend_fetch = false;
+                }
+            }
+
             // ── PDF path ────────────────────────────────────────────────────
             if (item.pdf_url && item.pdf_needs_backend_fetch) {
                 pdfAttempted = true;
+                jobPdfAttempted = true;
                 console.log(`📄 [PDF] Backend fetch required: ${item.pdf_url}`);
                 await setStatus(PIPELINE_STATUS.TEXT_EXTRACTING, {
                     status_note: `PDF download started: ${item.pdf_url}`,
@@ -687,6 +799,7 @@ export const processJob = async (jobData) => {
 
                 if (pdfResult.success) {
                     pdfSuccess = true;
+                    jobPdfSuccess = true;
 
                     // Pass 2 AI — refine item + generate markdown_body from PDF
                     const promptPass2 = buildPass2Prompt(item, pdfResult.text);
@@ -841,7 +954,8 @@ export const processJob = async (jobData) => {
                 status_note: "All extracted notifications already existed in DB",
                 "published.status": "duplicate",
                 "published.at": new Date(),
-                "ai.pdf_attempted": false,
+                "ai.pdf_attempted": jobPdfAttempted,
+                "ai.pdf_success": jobPdfSuccess,
             });
         } else {
             const allPublished = publishedItems.every((i) => i.status === "published");
@@ -851,6 +965,8 @@ export const processJob = async (jobData) => {
                 "published.notification_ids": publishedItems.map((i) => i.id),
                 "published.status": finalStatus,
                 "published.at": new Date(),
+                "ai.pdf_attempted": jobPdfAttempted,
+                "ai.pdf_success": jobPdfSuccess,
             });
         }
 
