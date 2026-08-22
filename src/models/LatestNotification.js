@@ -86,6 +86,16 @@ const LatestNotificationSchema = new mongoose.Schema(
       trim: true,
     },
 
+    // Last date for candidates to apply (distinct from notification publication date)
+    application_last_date: {
+      type: Date,
+    },
+
+    application_last_date_raw: {
+      type: String,
+      trim: true,
+    },
+
     new_or_updated: {
       type: String,
       enum: ["New", "Updated"],
@@ -146,6 +156,17 @@ const LatestNotificationSchema = new mongoose.Schema(
     // Optional: full AI response
     ai_response: {
       type: mongoose.Schema.Types.Mixed,
+    },
+
+    // Evidence traceability — which part of the diff grounded this notification
+    source_evidence: {
+      evidence_source: {
+        type: String,
+        enum: ["diff_added", "diff", "fallback", "unknown"],
+        default: "unknown",
+      },
+      matched_token: { type: String },
+      score:         { type: Number },
     },
   },
   {

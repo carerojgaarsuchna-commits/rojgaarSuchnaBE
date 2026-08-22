@@ -3,13 +3,14 @@ import { callTextLlm, getTextModel } from "./ai-api/aiProvider.js";
 import crypto from "crypto";
 import axios from "axios";
 import { createRequire } from "module";
+import { UnrecoverableError } from "bullmq";
 import { LatestNotification } from "../models/LatestNotification.js";
 import { normalizeNotificationCategory } from "../utils/notificationCategory.js";
 import { buildSlug, generateUniqueSlug } from "../utils/helper.js";
-// import { createAIBlog } from "./latestJobsService.js";
 import { updateRawEventStatus } from "../services/pipeline/rawEvent.service.js";
 import { PIPELINE_STATUS } from "../constants/pipelineStatus.js";
 import { fetchWatchSnapshot } from "./changedetection.service.js";
+import { buildPass1Prompt, buildPass2Prompt } from "./prompt-ai.js";
 
 // pdf-parse is a CJS module — dynamic import() does not interop reliably in ESM.
 // createRequire is the standard Node.js fix for CJS packages in ESM files.
@@ -25,7 +26,9 @@ const PDF_TEXT_LIMIT = Number(process.env.PDF_TEXT_LIMIT) || 15000;
 
 const Pass1ItemSchema = z.object({
     title: z.string().min(1),
-    original_title: z.string().min(1),
+    // Contract explicitly allows "" when no exact official title is available —
+    // must NOT require min(1) or valid AI output gets rejected.
+    original_title: z.string().optional().default(""),
     summary: z.string().min(1),
     source_url: z.string().min(1),
     department: z.string().optional().default(""),
@@ -33,6 +36,7 @@ const Pass1ItemSchema = z.object({
     category: z.string().min(1),
     notification_type: z.string().optional().default("Other"),
     notification_date: z.string().optional().default(""),
+    application_last_date: z.string().optional().default(""),
     new_or_updated: z.enum(["New", "Updated"]).optional().default("New"),
     confidence: z.number().min(0).max(100).optional().default(80),
     raw_explanation: z.string().optional().default(""),
@@ -58,7 +62,7 @@ const Pass1ResponseSchema = z.union([
 
 const Pass2ItemSchema = z.object({
     title: z.string().min(1),
-    original_title: z.string().optional(),
+    original_title: z.string().optional().default(""),
     summary: z.string().optional(),
     source_url: z.string().optional(),
     pdf_url: z.string().nullable().optional(),
@@ -67,6 +71,7 @@ const Pass2ItemSchema = z.object({
     category: z.string().optional(),
     notification_type: z.string().optional(),
     notification_date: z.string().optional(),
+    application_last_date: z.string().optional(),
     new_or_updated: z.enum(["New", "Updated"]).optional(),
     confidence: z.number().min(0).max(100).optional(),
     raw_explanation: z.string().optional(),
@@ -110,37 +115,48 @@ export function extractJsonFromText(rawText) {
 // ─── HTML cleaning ────────────────────────────────────────────────────────────
 
 /**
- * Clean full page HTML snapshot for AI processing.
- * Removes scripts, styles, nav, footer, SVGs and converts relative links to absolute.
+ * Clean HTML snapshot for AI processing.
+ *
+ * ONLY removes CSS and JavaScript.
+ * Does NOT modify HTML structure, links, attributes, images,
+ * headers, footers, navigation, or visible content.
  */
-export function cleanHtmlSnapshot(rawHtml, baseUrl = "") {
-    if (!rawHtml || typeof rawHtml !== "string") return "";
+export function cleanHtmlSnapshot(rawHtml) {
+    if (!rawHtml || typeof rawHtml !== "string") {
+        return "";
+    }
 
     let html = rawHtml;
 
-    // Remove noise tags
-    html = html.replace(/<(script|style|nav|footer|header|svg)[\s\S]*?<\/\1>/gi, "");
+    // Remove <script>...</script>
+    html = html.replace(
+        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+        ""
+    );
 
-    // Remove inline base64 images
-    html = html.replace(/src=["']data:image\/[^"']+["']/gi, 'src=""');
+    // Remove <style>...</style>
+    html = html.replace(
+        /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+        ""
+    );
 
-    // Convert relative hrefs to absolute
-    if (baseUrl) {
-        html = html.replace(/href=["']([^"']+)["']/gi, (match, hrefValue) => {
-            try {
-                if (
-                    hrefValue.startsWith("javascript:") ||
-                    hrefValue.startsWith("mailto:") ||
-                    hrefValue.startsWith("#")
-                ) return match;
-                return `href="${new URL(hrefValue, baseUrl).href}"`;
-            } catch {
-                return match;
-            }
-        });
-    }
+    return html.trim();
+}
 
-    return html.replace(/\n\s*\n/g, "\n").trim();
+// ─── Title normalization (for dedupe hashing) ─────────────────────────────────
+
+/**
+ * Normalize a title for use in the dedupe hash: lowercase, collapse
+ * whitespace, strip punctuation noise. Two near-identical titles scraped
+ * with slightly different whitespace/casing must hash identically.
+ */
+export function normalizeTitleForHash(title) {
+    return (title || "")
+        .toLowerCase()
+        .normalize("NFKC")
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
 // ─── Event hash ───────────────────────────────────────────────────────────────
@@ -164,317 +180,11 @@ export function stripSecretFromPayload(payload) {
     return safePayload;
 }
 
-// ─── Pass 1 prompt ────────────────────────────────────────────────────────────
-
-function buildPrompt(payload, recentDocs = []) {
-    const {
-        watch_uuid,
-        watch_title,
-        watch_url,
-        change_datetime,
-        diff,
-        diff_added,
-        diff_removed,
-        snapshot_html,
-    } = payload;
-
-    const recentContext = recentDocs.length > 0
-        ? `==================================================
-RECENT NOTIFICATIONS FROM THIS SOURCE (last ${recentDocs.length})
-Use these to detect near-duplicates and determine new_or_updated status.
-==================================================
-${recentDocs.map(d =>
-            `- title: "${d.title}" | date: ${d.notification_date || "unknown"} | category: ${d.category}`
-        ).join("\n")}
-
-`
-        : "";
-
-    return `
-    You are the content extraction engine for "Rojgaar Suchna", a platform that monitors official Indian government websites for recruitment, examination, admission, and other candidate-related notifications.
-
-    Your job is to analyze a detected website change and determine whether it contains one or more genuine, publishable recruitment-related notifications.
-
-    ==================================================
-    CONTEXT
-    ==================================================
-
-    Watch UUID:
-    ${watch_uuid}
-
-    Website Name:
-    ${watch_title}
-
-    Website URL:
-    ${watch_url}
-
-    Detected At:
-    ${change_datetime}
-
-    PRIMARY INPUT (Extract notifications ONLY from this):
-    ${diff_added}
-
-    REFERENCE INPUT (Never extract new notifications from this):
-    ${diff_removed}
-
-    FALLBACK INPUT (Use ONLY when PRIMARY INPUT is empty):
-    ${diff}
-
-    HTML SNAPSHOT (Use ONLY to resolve PDF/document hrefs found in diff_added):
-    ${snapshot_html ? snapshot_html.slice(0, 20000) : "Not available"}
-
-    ${recentContext}==================================================
-    GENERAL RULES
-    ==================================================
-
-    Source Priority (STRICT)
-
-    1. Extract notifications ONLY from diff_added.
-    2. If diff_added is empty, extract from diff.
-    3. Never create a notification solely from diff_removed.
-    4. diff_removed exists ONLY to determine whether a notification is Updated.
-    5. If a notification appears only in diff_removed, ignore it completely.
-    6. Never combine information from diff_added and diff_removed into a new notification.
-    7. Never invent, complete, or assume missing information.
-    8. Website Name and Website URL are authoritative.
-    9. Strip HTML, CSS, JavaScript, visitor counters and formatting artifacts before analysis.
-    10. Return ONLY valid JSON.
-    11. Do NOT return markdown.
-    12. Do NOT explain anything outside the JSON.
-
-    ==================================================
-    CHANGE INTERPRETATION RULES
-    ==================================================
-
-    Interpret the inputs exactly as follows:
-
-    diff_added
-    -------------
-    Contains content that has appeared on the website.
-    Only this content may produce NEW notifications.
-
-    diff_removed
-    -------------
-    Contains content that disappeared from the website.
-    This content MUST NOT produce new notifications.
-
-    A notification found ONLY in diff_removed means it was removed from the page.
-    Ignore it unless it clearly represents an updated version of the SAME notification found in diff_added.
-
-    diff
-    -------------
-    Contains both added and removed content.
-    Use it ONLY when diff_added is empty.
-    Never extract from diff if diff_added contains recruitment information.
-
-    ==================================================
-    STEP 1 — RELEVANCE CHECK
-    ==================================================
-
-    Determine whether the content contains one or more genuine recruitment-related notifications.
-
-    Relevant examples include:
-
-    - Job / Job Vacancy / Recruitment Advertisement
-    - Result / Merit List / Cut Off
-    - Admit Card / Call Letter
-    - Answer Key
-    - Admission / Counselling
-    - Syllabus / Exam Schedule
-    - Interview Schedule / Document Verification / Medical Examination
-    - PET / CBT / Shortlist / Application Status / City Intimation
-    - Corrigendum / Scholarship / Tender
-
-    Ignore completely if the change is only:
-
-    - Visitor counter / IP address / Server name / Captcha
-    - Accessibility text / Footer / Copyright / CSS / JavaScript
-    - HTML fragments / Logo / Banner / Image / Menu / Breadcrumb
-    - Contact information / Social links / Formatting changes
-    - Whitespace changes / Table reordering / Duplicate unchanged content
-    - Commercial advertisements
-    - Generic buttons such as: Click Here, Download, Login, View, PDF
-    unless surrounding text clearly identifies an actual recruitment notification.
-
-    If the provided text is obviously truncated or incomplete and reliable extraction is impossible, never guess the missing information.
-
-    If nothing publishable exists, return ONLY:
-
-    {
-    "relevant": false,
-    "reason": "Short explanation."
-    }
-
-    ==================================================
-    STEP 2 — EXTRACTION
-    ==================================================
-
-    If one or more publishable notifications exist, return:
-
-    {
-    "relevant": true,
-    "publish": true,
-    "watch_uuid": "${watch_uuid}",
-    "items": [
-        {
-        "title": "",
-        "original_title": "",
-        "summary": "",
-        "source_url": "",
-        "department": "",
-        "body": "",
-        "category": "",
-        "notification_type": "",
-        "notification_date": "",
-        "new_or_updated": "",
-        "confidence": 0,
-        "raw_explanation": "",
-        "pdf_url": null,
-        "pdf_needs_backend_fetch": false,
-        "is_duplicate": false
-        }
-    ]
-    }
-
-    ==================================================
-    PDF FIELDS — IMPORTANT
-    ==================================================
-
-    pdf_url:
-    IMPORTANT CONTEXT: The HTML SNAPSHOT is text-only — all <a href="..."> attributes
-    are stripped by the monitoring system. You will see filenames and file sizes
-    (e.g. "14082026-864_0001.pdf File size: 961 kB") but NOT the full download URL.
-    This is expected — the backend will resolve the filename to a full URL automatically.
-
-    Rules:
-    - If a full https:// URL is explicitly visible in diff_added or the SNAPSHOT text:
-        → Use it directly as pdf_url.
-    - If you see attachment filenames OR an "Attachments" section with file names
-      (even without a full URL, even a relative path, or just a bare filename):
-        → Set pdf_url to the EXACT filename or path shown (e.g. "14082026-864_0001.pdf").
-        → The backend will fetch the source page HTML and resolve it to a full URL.
-    - If no filename, no URL, and no document signal is visible at all:
-        → Set pdf_url to null.
-    - Do NOT invent or construct URLs. Only use what is explicitly visible.
-
-    NOTE ON EXTENSIONS: Many government sites do NOT use .pdf extension.
-    Document links may end in .docx, .doc, .aspx, .php?id=123, or even a plain path
-    with no extension. Treat ANY file attachment listed in the content as a document,
-    regardless of file extension.
-
-    pdf_needs_backend_fetch:
-    - Set to true whenever pdf_url is non-null (filename, partial path, or full URL).
-    - Set to false only when pdf_url is null.
-    - Do NOT set to false just because the URL is not a full http:// link — the backend
-      handles filename-to-URL resolution automatically.
-
-    is_duplicate:
-    - Set to true if this notification appears to already exist in the RECENT NOTIFICATIONS list above (same title, date, and category).
-    - Set to false otherwise.
-
-    ==================================================
-    MULTIPLE NOTIFICATIONS
-    ==================================================
-
-    Return ONE object inside "items" for EACH distinct notification.
-
-    Do NOT merge unrelated notifications.
-    Language variants of the SAME notification (English, Hindi, Marathi, Tamil) = ONE notification.
-    Never create an item for content that appears only in diff_removed.
-
-    ==================================================
-    FIELD RULES
-    ==================================================
-    title — Human-friendly SEO title (40–80 chars, Title Case)
-    original_title — Exact official title, no rewording
-    summary — 2–3 sentences: what changed + what candidates should do next
-    source_url — Exactly the Website URL provided above
-    body — Recruiting organization name (1-2 sentences)
-    department — Ministry/department (infer only when obvious)
-    category — EXACTLY one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender
-    notification_type — e.g. Recruitment Advertisement, Result, Answer Key, Corrigendum, etc.
-    notification_date — YYYY-MM-DD (use Detected At if no explicit date; note this in raw_explanation)
-    new_or_updated — "New" or "Updated"
-    confidence — 0-100 (95+ = complete official info; below 60 = needs review)
-    raw_explanation — Brief internal note on any inference or uncertainty
-
-    ==================================================
-    FINAL RULES
-    ==================================================
-
-    - Never fabricate facts, dates, or notification numbers.
-    - Category must be exactly one of the allowed values above.
-    - Return ONLY valid JSON. No prose. No markdown code fences.
-    - A notification MUST originate from diff_added.
-    `;
-}
-
-// ─── Pass 2 prompt ────────────────────────────────────────────────────────────
-
-function buildPass2Prompt(pass1Item, pdfText) {
-    return `
-You are the content refinement engine and blog writer for "Rojgaar Suchna".
-We have already extracted preliminary notification data from a website change (Pass 1).
-Now, we have extracted the FULL TEXT of the official PDF document related to this notification.
-
-==================================================
-PASS 1 EXTRACTED ITEM (Reference only — do NOT blindly copy these values)
-==================================================
-${JSON.stringify(pass1Item, null, 2)}
-
-==================================================
-OFFICIAL PDF CONTENT (AUTHORITATIVE — single source of truth)
-==================================================
-${pdfText.slice(0, PDF_TEXT_LIMIT)}
-
-==================================================
-INSTRUCTIONS
-==================================================
-1. Treat the OFFICIAL PDF CONTENT as the single source of truth.
-2. Refine ALL fields (title, summary, department, body, category, notification_type, notification_date) from the official PDF text.
-3. Do NOT hardcode or blindly copy category/notification_type from Pass 1. Re-evaluate them independently from the PDF content.
-4. Keep the category strictly one of: Job, Result, Admit Card, Answer Key, Syllabus, Admission, Notice, Scholarship, Tender.
-5. Also generate a complete human-friendly SEO-optimized blog article in the "markdown_body" field.
-6. The markdown_body MUST be in PURE MARKDOWN format ONLY. Do NOT use any HTML tags.
-7. Return ONLY valid JSON in the exact format below. No prose, no markdown code fences.
-
-==================================================
-JSON OUTPUT FORMAT
-==================================================
-{
-    "title": "Refined SEO Title Case Title from PDF",
-    "original_title": "${pass1Item.original_title || ""}",
-    "summary": "Updated 2-3 sentence summary from PDF...",
-    "source_url": "${pass1Item.source_url || ""}",
-    "pdf_url": "${pass1Item.pdf_url || ""}",
-    "department": "Ministry/Department Name as stated in PDF",
-    "body": "Recruiting organization name (1-2 sentences from PDF)",
-    "category": "",
-    "notification_type": "",
-    "notification_date": "YYYY-MM-DD",
-    "new_or_updated": "${pass1Item.new_or_updated || "New"}",
-    "confidence": 95,
-    "raw_explanation": "Refined using Pass 2 PDF. Category determined from PDF content.",
-    "markdown_body": "Exact Output Structure (copy this format): # SEO Title (55 chars max, keyword front-loaded) Meta Description (155 chars max, keyword + CTA) ### Short Introduction (100 words max) ### 📅 Important Dates | Event | Date | |-------|------| | ... | ... | ### 💼 Vacancy Details - List posts, expected vacancies - Education table ### 👤 Eligibility Criteria Numbered requirements + quick checklist ### 📊 Age Limit Table | Post | Age | Birth Range | ### 💰 Application Fee Details + payment methods ### 🧭 Selection Process 3 stages with bullets ### 💵 Salary & Benefits Year-wise breakdown ### 📝 How to Apply (7 Steps) 1. Visit joinindianarmy.nic.in ... ### 📂 Required Documents Bullet list with file specs ### ✅ Why Apply Now? 5 bullet benefits ### 🧠 Preparation Tips 6 numbered tips ### ❓ FAQs (6 Questions) Q1: [Question] A: [Answer] ### 🎯 Final Call-to-Action Urgent CTA + official links"
-}
-
-CRITICAL RULES FOR markdown_body:
-- Use ONLY Markdown syntax. NEVER use HTML tags.
-- Tables MUST use Markdown format: | Column | Column |
-- Lists MUST use: - item  OR  1. item
-- Headings MUST use: ### Heading
-- Write in simple English for Tier-2/3 city readers across India.
-- Short sentences (under 20 words). Max 3 lines per paragraph.
-- Active, friendly, urgent tone.
-- Use ONLY facts from the official PDF. Never invent dates, fees, vacancies, or links.
-`;
-}
-
-// ─── PDF download ─────────────────────────────────────────────────────────────
-
 /**
  * Safely download a PDF file and extract plain text content.
  * Resolves relative URLs, checks content-type, bounds size and text length.
+ * Text is truncated to PDF_TEXT_LIMIT before being handed to any LLM call,
+ * to bound token cost/latency on unusually large documents.
  * Returns { success: true, text } or { success: false, error }.
  */
 export async function downloadAndExtractPdfText(pdfUrl, watchUrl = "") {
@@ -527,8 +237,18 @@ export async function downloadAndExtractPdfText(pdfUrl, watchUrl = "") {
             return { success: false, error: "Extracted PDF text is empty (scanned image PDF or no text layer)" };
         }
 
-        console.log(`✅ [PDF] Extracted ${extractedText.length} chars from PDF.`);
-        return { success: true, text: extractedText };
+        // Bound the text length before it's ever handed to an LLM prompt.
+        let truncated = false;
+        if (extractedText.length > PDF_TEXT_LIMIT) {
+            extractedText = extractedText.slice(0, PDF_TEXT_LIMIT);
+            truncated = true;
+        }
+
+        console.log(
+            `✅ [PDF] Extracted ${extractedText.length} chars from PDF.` +
+            (truncated ? ` (truncated to PDF_TEXT_LIMIT=${PDF_TEXT_LIMIT})` : "")
+        );
+        return { success: true, text: extractedText, truncated };
     } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error(`⚠️ [PDF] Failed to download/parse PDF (${pdfUrl}): ${errorMsg}`);
@@ -557,12 +277,219 @@ export function safeToPublish(item) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function generateHash(item, watch_uuid) {
+    const normalizedTitle = normalizeTitleForHash(item?.original_title || item?.title || "");
     return crypto
         .createHash("sha256")
-        .update(
-            `${watch_uuid}|${item?.original_title || item?.title || ""}|${item?.notification_date || ""}|${item?.category || ""}`
-        )
+        .update(`${watch_uuid}|${normalizedTitle}|${item?.notification_date || ""}`)
         .digest("hex");
+}
+
+/**
+ * Classify AI errors as permanent (non-retryable) vs transient.
+ * Permanent errors include quota exhaustion, invalid credentials, unknown model.
+ * Transient errors (network, 429 temporary, timeout) should still be retried.
+ */
+function isPermanentAIError(message = "") {
+    return (
+        /rate.limit.exceeded.*free-models-per-day/i.test(message) ||
+        /insufficient.credits/i.test(message) ||
+        /invalid.api.key/i.test(message) ||
+        /model.*not.*(found|available)/i.test(message)
+    );
+}
+
+/**
+ * Build a deterministic minimal markdown article from Pass 1 structured data.
+ * Used when no Pass 2 ran (no PDF, or PDF fetch/refinement failed). Guarantees
+ * markdown_body exists without making an extra LLM call (zero hallucination risk).
+ */
+function buildDeterministicMarkdown(item, sourceUrl) {
+    const department = item.department || "";
+    const notifDate = item.notification_date || "";
+    const lastDate = item.application_last_date || "";
+
+    const rows = [
+        `| **Category**          | ${item.category || "—"} |`,
+        `| **Notification Type** | ${item.notification_type || "—"} |`,
+        department ? `| **Department**        | ${department} |` : null,
+        notifDate ? `| **Notification Date** | ${notifDate} |` : null,
+        lastDate ? `| **Last Date to Apply**| ${lastDate} |` : null,
+        `| **Status**            | ${item.new_or_updated || "New"} |`,
+    ].filter(Boolean).join("\n");
+
+    return [
+        `# ${item.title}`,
+        ``,
+        `> **${item.notification_type || item.category}**${department ? " — " + department : ""}`,
+        ``,
+        `## Summary`,
+        ``,
+        item.summary || "",
+        ``,
+        `## Details`,
+        ``,
+        `| Field | Value |`,
+        `|-------|-------|`,
+        rows,
+        ``,
+        `## How to Check / Apply`,
+        ``,
+        `Visit the official website for complete details and to submit your application or check the notification.`,
+        ``,
+        `**Official Source:** [${sourceUrl}](${sourceUrl})`,
+    ].join("\n");
+}
+
+/**
+ * Evidence Gate — determines whether an AI-extracted notification item is
+ * grounded in the actual changed content (diff_added or diff).
+ *
+ * Returns { valid: boolean, evidenceType: string, matchedToken: string|null, score: number }
+ *
+ * Token tiers:
+ *   Strong  (score 3) — CEN/advt number, exact multi-word official phrase (≥ 3 words, ≥ 12 chars from original_title)
+ *   Medium  (score 2) — 2-word meaningful pair, post name + year, date in any recognisable format
+ *   Weak    (score 1) — single generic word (never passes alone)
+ *
+ * Passing threshold: score ≥ 3 (one Strong OR two Medium).
+ * Weak tokens alone are never sufficient.
+ *
+ * When evidenceSource is null (neither diff_added nor diff available),
+ * the gate rejects — it does NOT silently pass.
+ */
+export function checkDiffEvidence(item, evidenceText, evidenceSource) {
+    // No diff source → cannot verify, must reject
+    if (!evidenceSource || !evidenceText || evidenceText.trim().length === 0) {
+        return { valid: false, evidenceType: "no_source", matchedToken: null, score: 0 };
+    }
+
+    const haystack = evidenceText.toLowerCase();
+
+    // ── Extract candidate tokens from original_title (preferred) then title ──
+    const rawTitle = (item.original_title || item.title || "").trim();
+    const generatedTitle = (item.title || "").trim();
+
+    // Generic words to exclude from meaningful matches
+    const STOP_WORDS = new Set([
+        "recruitment", "vacancy", "vacancies", "notification", "notice",
+        "result", "admit", "card", "application", "online", "apply",
+        "exam", "the", "for", "and", "of", "in", "at", "to", "by",
+        "post", "posts", "jobs", "job", "new", "updated", "government",
+        "india", "2026", "2025", "2024", "board", "department",
+    ]);
+
+    const isStopWord = (w) => STOP_WORDS.has(w.toLowerCase());
+
+    let bestScore = 0;
+    let bestToken = null;
+
+    // ── STRONG: CEN / advertisement / circular numbers ──
+    const cenPattern = /\bCEN[\s-]+[\d]+\/[\d]+\b|\bCEN[\s-]+[\d]+\b/gi;
+    const advtPattern = /\b(?:advt|advertisement|circular|notification)[\.\s#-]*no[\.\s]*[\w\/\d-]+/gi;
+    const docPattern = /\b[\w-]+\.pdf\b|\b[\w-]+\.docx\b/gi;
+
+    for (const pattern of [cenPattern, advtPattern, docPattern]) {
+        const sourceMatches = rawTitle.match(pattern) || [];
+        for (const token of sourceMatches) {
+            if (haystack.includes(token.toLowerCase())) {
+                return { valid: true, evidenceType: evidenceSource, matchedToken: token, score: 3 };
+            }
+        }
+    }
+
+    // ── STRONG: multi-word exact phrase from original_title (≥ 3 words, ≥ 12 chars) ──
+    const titleWords = rawTitle
+        .replace(/[^a-zA-Z0-9 ]/g, " ")
+        .split(/\s+/)
+        .map(w => w.toLowerCase())
+        .filter(w => w.length >= 3 && !isStopWord(w));
+
+    // Build trigrams from meaningful words
+    for (let i = 0; i <= titleWords.length - 3; i++) {
+        const phrase = titleWords.slice(i, i + 3).join(" ");
+        if (phrase.length >= 12 && haystack.includes(phrase)) {
+            bestScore = 3;
+            bestToken = phrase;
+            break;
+        }
+    }
+
+    if (bestScore >= 3) {
+        return { valid: true, evidenceType: evidenceSource, matchedToken: bestToken, score: bestScore };
+    }
+
+    // ── MEDIUM: bigrams (2-word pairs) from original_title ──
+    for (let i = 0; i <= titleWords.length - 2; i++) {
+        const pair = `${titleWords[i]} ${titleWords[i + 1]}`;
+        if (pair.length >= 8 && haystack.includes(pair)) {
+            bestScore = Math.max(bestScore, 2);
+            if (!bestToken) bestToken = pair;
+        }
+    }
+
+    // Need two Medium hits (score >= 4) or one Strong hit (score >= 3)
+    // One bigram alone (score 2) is insufficient — check for a second match
+    if (bestScore >= 2) {
+        // Count total medium matches
+        let mediumCount = 0;
+        let firstToken = null;
+        for (let i = 0; i <= titleWords.length - 2; i++) {
+            const pair = `${titleWords[i]} ${titleWords[i + 1]}`;
+            if (pair.length >= 8 && haystack.includes(pair)) {
+                mediumCount++;
+                if (!firstToken) firstToken = pair;
+            }
+        }
+        if (mediumCount >= 2) {
+            return { valid: true, evidenceType: evidenceSource, matchedToken: firstToken, score: 4 };
+        }
+    }
+
+    // ── MEDIUM: date match (any recognisable format) ──
+    const notifDate = (item.notification_date || "").trim(); // YYYY-MM-DD
+    if (notifDate && notifDate.length >= 8) {
+        // Generate multiple date formats
+        const [year, month, day] = notifDate.split("-");
+        const dateVariants = [
+            notifDate,                          // 2026-07-14
+            `${day}-${month}-${year}`,          // 14-07-2026
+            `${day}/${month}/${year}`,          // 14/07/2026
+            `${day}.${month}.${year}`,          // 14.07.2026
+        ].filter(Boolean);
+
+        for (const variant of dateVariants) {
+            if (haystack.includes(variant.toLowerCase())) {
+                bestScore = Math.max(bestScore, 2);
+                bestToken = bestToken || `date:${variant}`;
+            }
+        }
+    }
+
+    // ── WEAK: single meaningful word from generated title ──
+    // (never sufficient alone, logged only)
+    const genWords = generatedTitle
+        .replace(/[^a-zA-Z0-9 ]/g, " ")
+        .split(/\s+/)
+        .map(w => w.toLowerCase())
+        .filter(w => w.length >= 5 && !isStopWord(w));
+
+    let weakScore = 0;
+    for (const word of genWords) {
+        if (haystack.includes(word)) {
+            weakScore = 1;
+            if (!bestToken) bestToken = word;
+            break;
+        }
+    }
+
+    // Final decision: need score >= 3 to pass
+    const finalScore = bestScore > 0 ? bestScore : weakScore;
+    return {
+        valid: finalScore >= 3,
+        evidenceType: evidenceSource,
+        matchedToken: bestToken,
+        score: finalScore,
+    };
 }
 
 function normalizeNotificationItem(item) {
@@ -587,6 +514,12 @@ function normalizeNotificationItem(item) {
 
 /**
  * Core V3 Webhook Processing Engine (2-Pass Adaptive AI Pipeline).
+ *
+ * Pass 1: relevance + extraction + PDF discovery, merged, → items[].
+ * Pass 2: per-item, only when a PDF was found AND downloaded AND text
+ *         extracted, refine the item + generate the blog article.
+ * Items with no PDF (or a failed PDF fetch) get a deterministic markdown
+ * fallback instead of a second LLM call — zero hallucination risk.
  *
  * Receives job.data from BullMQ which includes:
  *   - all webhook payload fields (watch_uuid, diff_added, etc.)
@@ -614,47 +547,41 @@ export const processJob = async (jobData) => {
     try {
         console.log(`🚀 [V3 Pipeline] Processing for Watch: ${payload.watch_title || payload.watch_uuid}`);
 
-        // ── Step 1: 
-
-        // ── Step 1b + 1c: Parallel — DB context + ChangeDetection API snapshot fetch ──
+        // ── Step 1: Parallel — DB context + ChangeDetection API snapshot fetch ──
         // Both are best-effort: failures warn but never abort the pipeline.
-        let recentDocs = [];
-        let liveHtml; // prefer payload HTML; CDIO fetch fills this in
+        let liveHtml = "";
 
         await Promise.allSettled([
-            // 1b: recent notifications for this watch (near-duplicate detection)
+
+
+            // 1b: fetch latest HTML snapshot from ChangeDetection API.
+            // Wrapped in its own try/catch — a failure here must warn and
+            // leave liveHtml empty, never abort the whole job or swallow
+            // silently the way Promise.allSettled would otherwise let it.
             (async () => {
                 try {
-                    recentDocs = await LatestNotification
-                        .find({ watch_uuid: payload.watch_uuid })
-                        .select("title original_title category notification_date dedupe_hash")
-                        .sort({ createdAt: -1 })
-                        .limit(20)
-                        .lean();
-                    console.log(`📚 [DB Context] ${recentDocs.length} recent notifications for watch: ${payload.watch_uuid}`);
-                } catch (dbErr) {
-                    console.warn(`⚠️ [DB Context] Could not fetch recent docs: ${dbErr.message}`);
-                }
-            })(),
-
-            // 1c: fetch latest HTML snapshot from ChangeDetection API
-            // This gives the AI real <a href> links so it can populate pdf_url.
-            // Skipped if payload already contains HTML (future-proof).
-            (async () => {
-                if (liveHtml) return; // payload had HTML — skip API call
-                const raw = await fetchWatchSnapshot(payload.watch_uuid);
-                if (raw) {
-                    liveHtml = cleanHtmlSnapshot(raw, payload.watch_url);
-                    console.log(`🌐 [CDIO] Cleaned snapshot: ${liveHtml.length} chars for watch: ${payload.watch_uuid}`);
+                    const raw = await fetchWatchSnapshot(payload.watch_uuid);
+                    if (raw) {
+                        liveHtml = cleanHtmlSnapshot(raw);
+                        console.log(`🌐 [CDIO] Cleaned snapshot: ${liveHtml.length} chars for watch: ${payload.watch_uuid}`);
+                    }
+                } catch (snapErr) {
+                    console.warn(`⚠️ [CDIO] Snapshot fetch failed: ${snapErr.message}`);
                 }
             })(),
         ]);
 
-        const enrichedPayload = { ...payload, snapshot_html: liveHtml };
+        // Determine which diff source Pass 1 will use — same source the Evidence Gate checks.
+        const evidenceSource = payload.diff_added?.trim()
+            ? "diff_added"
+            : payload.diff?.trim()
+                ? "diff"
+                : null;
 
-        // ── Step 2: Pass 1 AI ───────────────────────────────────────────────
-        // Build the prompt first so we can store it in the RawEvent for debugging.
-        const promptPass1 = buildPrompt(enrichedPayload, recentDocs);
+        // ── Step 2: Pass 1 AI — relevance + extraction + PDF discovery ──────
+        const enrichedPayload = { ...payload, snapshot: liveHtml };
+        const promptPass1 = buildPass1Prompt(enrichedPayload);
+
         const modelName = getTextModel();
 
         await setStatus(PIPELINE_STATUS.AI_PROCESSING, {
@@ -668,10 +595,16 @@ export const processJob = async (jobData) => {
             const pass1Result = await callTextLlm(promptPass1, modelName);
             pass1Raw = pass1Result.raw || "";
         } catch (aiErr) {
+            const permanent = isPermanentAIError(aiErr.message);
             await setStatus(PIPELINE_STATUS.AI_FAILED, {
                 status_note: `Pass 1 AI error: ${aiErr.message}`,
                 "ai.last_error": aiErr.message.slice(0, 500),
+                "ai.permanent_failure": permanent,
             });
+            // Quota/key/model errors are permanent — BullMQ must NOT retry.
+            if (permanent) {
+                throw new UnrecoverableError(`Pass 1 AI failed (permanent): ${aiErr.message}`);
+            }
             throw new Error(`Pass 1 AI failed: ${aiErr.message}`);
         }
 
@@ -720,31 +653,69 @@ export const processJob = async (jobData) => {
 
         const publishedItems = [];
 
+        // Outcome counters — kept distinct so the final status note is
+        // accurate instead of lumping evidence-gate rejections, AI-flagged
+        // duplicates, and real DB duplicates into one misleading bucket.
+        let evidenceRejectedCount = 0;
+        let aiDuplicateSkippedCount = 0;
+        let dbDuplicateCount = 0;
+
         // Job-level PDF tracking — OR-assigned inside the loop so any item that
         // triggers the PDF path sets the flag for the whole job.
         let jobPdfAttempted = false;
         let jobPdfSuccess = false;
 
-        // Page HTML cache for Step 2.5 URL resolution.
+        // Page HTML cache for Step 4.5 URL resolution.
         // Fetched at most once per job — reused for all items that need it.
         let resolvedPageHtml = null;
 
         // ── Step 5: Process each item ────────────────────────────────────────
         for (let item of data.items) {
-            // Skip AI-flagged duplicates (via DB context comparison)
+            // Skip AI-flagged duplicates. Per the Pass 1 contract this is
+            // always false, but the check is cheap and harmless to keep as
+            // a defensive backstop — real dedup happens later via the
+            // deterministic hash + atomic DB check regardless.
             if (item.is_duplicate === true) {
+                aiDuplicateSkippedCount++;
                 console.log(`🔁 [AI Duplicate] Skipping AI-identified duplicate: "${item.title}"`);
                 continue;
             }
 
-            let pdfAttempted = false;
+            // ── Evidence Gate ────────────────────────────────────────────────
+            // Verify that this notification is actually grounded in the changed
+            // content (diff_added or diff) — not extracted from the full HTML snapshot.
+            // This is the primary guard against counter/timestamp-only events
+            // producing false-positive notifications.
+            const evidenceText = evidenceSource === "diff_added"
+                ? (payload.diff_added || "")
+                : (payload.diff || "");
+            const gateResult = checkDiffEvidence(item, evidenceText, evidenceSource);
+
+            if (!gateResult.valid) {
+                evidenceRejectedCount++;
+                console.warn(
+                    `🚫 [Evidence Gate] Item rejected — score ${gateResult.score}/3 ` +
+                    `(source: ${gateResult.evidenceType}): "${item.title}"`
+                );
+                await setStatus(PIPELINE_STATUS.REJECTED, {
+                    status_note: `Evidence gate rejected: "${item.title}" ` +
+                        `(score ${gateResult.score}/3, source: ${gateResult.evidenceType})`,
+                });
+                continue;
+            }
+
+            console.log(
+                `✅ [Evidence Gate] Passed — score ${gateResult.score}/3 ` +
+                `matched "${gateResult.matchedToken}" in ${gateResult.evidenceType}: "${item.title}"`
+            );
+
             let pdfSuccess = false;
 
-            // ── Step 2.5: Resolve filename → full URL ────────────────────────
+            // ── Step 4.5: Resolve filename → full URL ────────────────────────
             // Pass 1 AI may return a bare filename as pdf_url (e.g. "14082026-864_0001.pdf")
             // because the snapshot is text-only and hrefs are stripped.
             // Fetch the source page HTML once per job and extract the matching href.
-            if (item.pdf_url && !item.pdf_url.startsWith("http") && item.pdf_needs_backend_fetch) {
+            if (item.pdf_url && !item.pdf_url.startsWith("http")) {
                 const filename = item.pdf_url;
                 try {
                     // Lazy-fetch and cache the source page HTML for this job
@@ -776,19 +747,20 @@ export const processJob = async (jobData) => {
                         // Href not found in page — clear so we don't attempt a broken download
                         console.warn(`⚠️ [URL Resolve] href for "${filename}" not found in source page. Clearing pdf_url.`);
                         item.pdf_url = null;
-                        item.pdf_needs_backend_fetch = false;
                     }
                 } catch (resolveErr) {
                     // Page fetch failed — clear to avoid a bad download attempt
                     console.warn(`⚠️ [URL Resolve] Source page fetch failed: ${resolveErr.message}. Clearing pdf_url.`);
                     item.pdf_url = null;
-                    item.pdf_needs_backend_fetch = false;
                 }
             }
 
             // ── PDF path ────────────────────────────────────────────────────
-            if (item.pdf_url && item.pdf_needs_backend_fetch) {
-                pdfAttempted = true;
+            // Whether to attempt a fetch is decided deterministically by the
+            // backend from pdf_url alone — the AI's pdf_needs_backend_fetch
+            // flag is informational only and is never trusted on its own,
+            // since a mismatch there must not silently skip a real document.
+            if (item.pdf_url) {
                 jobPdfAttempted = true;
                 console.log(`📄 [PDF] Backend fetch required: ${item.pdf_url}`);
                 await setStatus(PIPELINE_STATUS.TEXT_EXTRACTING, {
@@ -802,10 +774,10 @@ export const processJob = async (jobData) => {
                     jobPdfSuccess = true;
 
                     // Pass 2 AI — refine item + generate markdown_body from PDF
-                    const promptPass2 = buildPass2Prompt(item, pdfResult.text);
                     console.log(`🤖 [Pass 2] Refining item with official PDF content...`);
 
                     try {
+                        const promptPass2 = buildPass2Prompt(item, pdfResult.text);
                         const pass2Result = await callTextLlm(promptPass2, modelName);
                         const rawText2 = pass2Result.raw || "";
                         const jsonStr2 = extractJsonFromText(rawText2);
@@ -816,11 +788,13 @@ export const processJob = async (jobData) => {
                             const issues = v2.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
                             throw new Error(`Pass 2 Zod validation failed: ${issues}`);
                         }
-                        // Merge: PDF is authoritative; preserve original pdf_url
+                        // Merge: PDF-refined fields win; preserve original pdf_url
                         item = { ...item, ...v2.data, pdf_url: item.pdf_url };
                         console.log(`✨ [Pass 2] Item refined with official PDF.`);
                     } catch (p2Err) {
-                        // Pass 2 failure: keep Pass 1 item, mark for review
+                        // Pass 2 failure: keep Pass 1 item, mark for review.
+                        // The deterministic markdown fallback below still runs,
+                        // so this item is never left without a blog body.
                         console.warn(`⚠️ [Pass 2] Failed: ${p2Err.message}. Falling back to Pass 1 item.`);
                         item.raw_explanation = `${item.raw_explanation || ""} [Pass2 failed: ${p2Err.message}]`.trim();
                         item.confidence = Math.min(item.confidence || 50, 60);
@@ -835,29 +809,19 @@ export const processJob = async (jobData) => {
                 }
             }
 
-            // ── Blog fallback — only when no Pass 2 markdown_body ──────────
-            // Run ONLY if markdown_body is missing/too short AND pdf path was not taken or failed
-            //  this is use less that is why i have commented  leter i wil remove it
-            // if (!item.markdown_body || item.markdown_body.trim().length < 50) {
-            //     console.log(`📝 [Blog Fallback] markdown_body missing — generating via createAIBlog...`);
-            //     try {
-            //         const fallbackText = (
-            //             payload.diff_added ||
-            //             payload.snapshot_html ||
-            //             payload.diff ||
-            //             ""
-            //         ).slice(0, 12000);
-            //         if (fallbackText.trim()) {
-            //             const blogContent = await createAIBlog(fallbackText);
-            //             if (blogContent && blogContent.trim().length >= 50) {
-            //                 item.markdown_body = blogContent;
-            //                 console.log(`✅ [Blog Fallback] markdown_body generated successfully.`);
-            //             }
-            //         }
-            //     } catch (blogErr) {
-            //         console.warn(`⚠️ [Blog Fallback] createAIBlog failed: ${blogErr.message}`);
-            //     }
-            // }
+            // ── Deterministic markdown fallback ──────────────────────────────
+            // When no Pass 2 ran (no PDF, or PDF fetch/refinement failed), generate
+            // a minimal but complete markdown article from the structured item data.
+            // This is deterministic — no extra LLM call, zero hallucination risk.
+            // safeToPublish() still gates on confidence/pdf_download_failed etc.,
+            // so not all records will auto-publish even after this runs.
+            if (!item.markdown_body || item.markdown_body.trim().length < 50) {
+                item.markdown_body = buildDeterministicMarkdown(
+                    item,
+                    item.source_url || payload.watch_url || ""
+                );
+                console.log(`📝 [Markdown Fallback] Deterministic article built for: "${item.title}"`);
+            }
 
             // ── Normalize category & generate L2 dedup hash ─────────────────
             const normalizedItem = normalizeNotificationItem(item);
@@ -869,6 +833,11 @@ export const processJob = async (jobData) => {
             const rawDate = normalizedItem.notification_date;
             const parsedDate = rawDate ? Date.parse(rawDate) : NaN;
             const validNotificationDate = !isNaN(parsedDate) ? new Date(parsedDate) : new Date();
+
+            // application_last_date — keep distinct from notification_date
+            const rawLastDate = normalizedItem.application_last_date || "";
+            const parsedLastDate = rawLastDate ? Date.parse(rawLastDate) : NaN;
+            const validApplicationLastDate = !isNaN(parsedLastDate) ? new Date(parsedLastDate) : undefined;
 
             const isPublishable = safeToPublish(normalizedItem);
             const baseSlug = buildSlug(normalizedItem);
@@ -890,6 +859,8 @@ export const processJob = async (jobData) => {
                 notification_type: normalizedItem.notification_type || "Other",
                 notification_date: validNotificationDate,
                 notification_date_raw: rawDate || null,
+                application_last_date: validApplicationLastDate,
+                application_last_date_raw: rawLastDate || null,
                 new_or_updated: normalizedItem.new_or_updated || "New",
                 publish: isPublishable,
                 status: isPublishable ? "published" : "pending_review",
@@ -901,37 +872,82 @@ export const processJob = async (jobData) => {
                 },
                 webhook_payload: payload,
                 ai_response: data,
+                // Traceability: which diff token proved this notification
+                source_evidence: {
+                    evidence_source: gateResult.evidenceType || evidenceSource || "unknown",
+                    matched_token: gateResult.matchedToken || null,
+                    score: gateResult.score || 0,
+                },
             };
+
+            // Strip sibling items from ai_response before storing.
+            // Each LatestNotification doc represents ONE item. Storing the entire
+            // items[] array (with all N siblings) is pure bloat and a footgun
+            // for anything that reads ai_response.items[0] assuming it's "this doc's item".
+            // We store only the pass-level metadata + the specific extracted item.
+            const aiResponseForDoc = {
+                relevant: data.relevant,
+                publish: data.publish,
+                watch_uuid: data.watch_uuid,
+                // _item: the specific item this document was created from
+                _item: normalizedItem,
+                // total_siblings: how many items this event generated (for reference)
+                total_siblings: data.items?.length ?? 1,
+            };
+
+            // Overwrite ai_response in the doc with the stripped version
+            notificationDoc.ai_response = aiResponseForDoc;
 
             let savedDoc;
             let isDuplicate = false;
 
             try {
-                // Atomic upsert: $setOnInsert only executes on new insert
+                // Atomic upsert: $setOnInsert only executes on new insert.
+                // Use new: false so the pre-update document tells us:
+                //   - null   → nothing existed → this was a new insert
+                //   - object → doc existed    → this is a duplicate
+                // This is more reliable than checking lastErrorObject.upserted,
+                // which behaves inconsistently across Mongoose versions when new:true.
+                //
+                // Result shape is NOT stable across Mongoose/driver versions:
+                //   - some versions wrap it: { value, lastErrorObject, ok } (value may be null)
+                //   - other versions (rawResult renamed to includeResultMetadata in
+                //     Mongoose 7+/8+) return the document UNWRAPPED — meaning the
+                //     whole `result` itself is null on a fresh insert, not `{value:null}`.
+                // Passing both option names covers both APIs; normalizing the shape
+                // below means a Mongoose version bump can't crash this again.
                 const result = await LatestNotification.findOneAndUpdate(
                     { dedupe_hash: dedupeHash },
                     { $setOnInsert: notificationDoc },
                     {
                         upsert: true,
-                        new: true,
+                        new: false,                 // return PRE-update doc (null = new insert)
                         setDefaultsOnInsert: true,
-                        rawResult: true,
+                        rawResult: true,             // legacy Mongoose option name
+                        includeResultMetadata: true, // canonical name in Mongoose 7+/8+
                     }
                 );
 
-                // Detect whether this was an insert or an existing doc
-                isDuplicate = !result.lastErrorObject?.upserted;
-                savedDoc = result.value;
+                const preUpdateDoc = result && typeof result === "object" && "value" in result
+                    ? result.value
+                    : (result ?? null);
+
+                isDuplicate = preUpdateDoc !== null;
 
                 if (isDuplicate) {
+                    savedDoc = preUpdateDoc; // existing doc
+                    dbDuplicateCount++;
                     console.log(`🔁 [L2 Dedup] Notification already exists in DB: "${normalizedItem.title}"`);
                 } else {
+                    // New insert: fetch the doc we just created so we have its _id
+                    savedDoc = await LatestNotification.findOne({ dedupe_hash: dedupeHash }).lean();
                     console.log(`✅ [DB] Notification stored (status="${notificationDoc.status}"): "${normalizedItem.title}"`);
                 }
             } catch (dbErr) {
                 // E11000 = race-condition duplicate on the unique index — treat as duplicate, not error
                 if (dbErr.code === 11000) {
                     isDuplicate = true;
+                    dbDuplicateCount++;
                     console.log(`🔁 [L2 Dedup] Race-condition duplicate caught (E11000): "${normalizedItem.title}"`);
                 } else {
                     throw new Error(`Database write failed: ${dbErr.message}`);
@@ -948,11 +964,27 @@ export const processJob = async (jobData) => {
         }
 
         // ── Step 6: Final RawEvent status update ────────────────────────────
-        if (publishedItems.length === 0) {
-            // All items were duplicates or skipped
-            await setStatus(PIPELINE_STATUS.DUPLICATE, {
-                status_note: "All extracted notifications already existed in DB",
-                "published.status": "duplicate",
+        // Each outcome bucket is reported separately so the status note is
+        // accurate — evidence-gate rejections and AI-flagged duplicates are
+        // NOT the same thing as a real DB duplicate, and conflating them
+        // hides real pipeline behaviour from anyone reading the status log.
+        const newCount = publishedItems.length;
+        const skippedNote = [
+            evidenceRejectedCount > 0 ? `${evidenceRejectedCount} rejected by evidence gate` : null,
+            aiDuplicateSkippedCount > 0 ? `${aiDuplicateSkippedCount} AI-flagged duplicate` : null,
+            dbDuplicateCount > 0 ? `${dbDuplicateCount} already existed in DB` : null,
+        ].filter(Boolean).join(", ");
+
+        if (newCount === 0) {
+            await setStatus(PIPELINE_STATUS.NOTIFICATION_DUPLICATE, {
+                status_note: skippedNote
+                    ? `No new notifications. ${skippedNote}.`
+                    : "No new notifications saved.",
+                "published.status": "notification_duplicate",
+                "published.new": 0,
+                "published.evidence_rejected": evidenceRejectedCount,
+                "published.ai_duplicate": aiDuplicateSkippedCount,
+                "published.db_duplicate": dbDuplicateCount,
                 "published.at": new Date(),
                 "ai.pdf_attempted": jobPdfAttempted,
                 "ai.pdf_success": jobPdfSuccess,
@@ -961,9 +993,13 @@ export const processJob = async (jobData) => {
             const allPublished = publishedItems.every((i) => i.status === "published");
             const finalStatus = allPublished ? PIPELINE_STATUS.PUBLISHED : PIPELINE_STATUS.PENDING_REVIEW;
             await setStatus(finalStatus, {
-                status_note: `${publishedItems.length} notification(s) saved`,
+                status_note: `${newCount} new notification(s) saved` + (skippedNote ? `; ${skippedNote}` : ""),
                 "published.notification_ids": publishedItems.map((i) => i.id),
                 "published.status": finalStatus,
+                "published.new": newCount,
+                "published.evidence_rejected": evidenceRejectedCount,
+                "published.ai_duplicate": aiDuplicateSkippedCount,
+                "published.db_duplicate": dbDuplicateCount,
                 "published.at": new Date(),
                 "ai.pdf_attempted": jobPdfAttempted,
                 "ai.pdf_success": jobPdfSuccess,

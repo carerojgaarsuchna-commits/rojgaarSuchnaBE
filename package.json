@@ -12,6 +12,7 @@
     "replace-domain": "node src/scripts/replaceDomain.js",
     "testAIAPI": "node src/service/latestJobsService.js",
     "processFailedQueue": "node src/scripts/processFailedQueue.js",
+    "testWithStaticPayload": "node src/scripts/testWithStaticPayload.js",
     "normalizeNotificationCategories": "node src/scripts/normalizeLatestNotificationCategories.js",
     "generateSlug": "node src/scripts/generateSlug.js"
   },

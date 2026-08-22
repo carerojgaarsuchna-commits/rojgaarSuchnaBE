@@ -24,6 +24,7 @@ export const PIPELINE_STATUS = {
   PUBLISHED: "published",
   REJECTED: "rejected",
   DUPLICATE: "duplicate",
+  NOTIFICATION_DUPLICATE: "notification_duplicate",
   PUBLISH_FAILED: "publish_failed",
 };
 
