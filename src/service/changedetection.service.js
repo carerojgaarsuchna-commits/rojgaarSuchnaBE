@@ -14,8 +14,8 @@
 import axios from "axios";
 
 const CDIO_BASE_URL = (process.env.CHANGEDETECTION_API_URL || "").replace(/\/$/, "");
-const CDIO_TOKEN    = process.env.CHANGEDETECTION_API_TOKEN || "";
-const HTML_TIMEOUT  = Number(process.env.PIPELINE_HTML_TIMEOUT_MS) || 4000;
+const CDIO_TOKEN = process.env.CHANGEDETECTION_API_TOKEN || "";
+const HTML_TIMEOUT = Number(process.env.PIPELINE_HTML_TIMEOUT_MS) || 4000;
 
 /**
  * Fetch the latest snapshot content for a given watch UUID.
@@ -33,21 +33,22 @@ export async function fetchWatchSnapshot(watchUuid) {
         return null;
     }
 
-    const url = `${CDIO_BASE_URL}/api/v1/watch/${watchUuid}/history/latest`;
 
     try {
-        console.log(`🌐 [CDIO] Fetching snapshot: ${url}`);
 
-        const response = await axios.get(url, {
-            headers: {
-                "x-api-key": CDIO_TOKEN,
-                "Accept": "text/html, text/plain, */*",
-            },
-            timeout: HTML_TIMEOUT,
-            maxContentLength: 10 * 1024 * 1024, // 10 MB cap
-            responseType: "text",               // prevent axios from auto-parsing HTML as JSON
-            validateStatus: (s) => s >= 200 && s < 300,
-        });
+        const response = await axios.get(
+            `${CDIO_BASE_URL}/api/v1/watch/${watchUuid}/history/latest?html=1`,
+            {
+                headers: {
+                    "x-api-key": CDIO_TOKEN,
+                    "Accept": "text/html",
+                },
+                timeout: HTML_TIMEOUT,
+                maxContentLength: 10 * 1024 * 1024,
+                responseType: "text",
+                validateStatus: (status) => status >= 200 && status < 300,
+            }
+        );
 
         const content = typeof response.data === "string" ? response.data : "";
 
@@ -61,7 +62,7 @@ export async function fetchWatchSnapshot(watchUuid) {
 
     } catch (err) {
         const status = err.response?.status;
-        const msg    = status
+        const msg = status
             ? `HTTP ${status}: ${err.response?.statusText || err.message}`
             : err.message;
         console.warn(`⚠️ [CDIO] Snapshot fetch failed for ${watchUuid}: ${msg}`);

@@ -565,6 +565,7 @@ export const processJob = async (jobData) => {
                         liveHtml = cleanHtmlSnapshot(raw);
                         console.log(`🌐 [CDIO] Cleaned snapshot: ${liveHtml.length} chars for watch: ${payload.watch_uuid}`);
                     }
+
                 } catch (snapErr) {
                     console.warn(`⚠️ [CDIO] Snapshot fetch failed: ${snapErr.message}`);
                 }
@@ -577,7 +578,6 @@ export const processJob = async (jobData) => {
             : payload.diff?.trim()
                 ? "diff"
                 : null;
-
         // ── Step 2: Pass 1 AI — relevance + extraction + PDF discovery ──────
         const enrichedPayload = { ...payload, snapshot: liveHtml };
         const promptPass1 = buildPass1Prompt(enrichedPayload);
