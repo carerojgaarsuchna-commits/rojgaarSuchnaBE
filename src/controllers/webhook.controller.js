@@ -1,38 +1,95 @@
-import webhookQueue from "../queues/webhook.queue.js"
-import { LatestNotification } from "../models/LatestNotification.js"
-import { latestJobsAIPromptSchema } from "../validators/latestJobsAIPromptValidator.js";
+import { LatestNotification } from "../models/LatestNotification.js";
+import webhookQueue from "../queues/webhook.queue.js";
+import { createRawEvent } from "../services/pipeline/rawEvent.service.js";
+import { stripSecretFromPayload, buildEventHash } from "../service/webhook.service.js";
+import { updateRawEventStatus } from "../services/pipeline/rawEvent.service.js";
+import { PIPELINE_STATUS } from "../constants/pipelineStatus.js";
+
+/**
+ * Fast Webhook Receiver Controller (<100ms response time).
+ *
+ * Secret authentication is handled upstream by verifyWebhook middleware
+ * using WEBHOOK_SECRET env variable. No duplicate check here.
+ *
+ * 1. Strips secret key from payload to protect credentials.
+ * 2. Calculates event_hash and checks for early duplicate webhooks.
+ * 3. Logs raw event to Database.
+ * 4. Pushes payload to BullMQ 'webhook' queue.
+ * 5. Immediately responds 200 OK to changedetection.io.
+ */
 const receiveChange = async (req, res) => {
     try {
-        await webhookQueue.add(
-            "process-webhook",
-            req.body, {
-            removeOnComplete: true,
-            attempts: 3
+        const rawPayload = req.body || {};
+
+        // Step 1: Strip secret key from payload before storage & queueing
+        // Secret authentication is already done by verifyWebhook middleware (WEBHOOK_SECRET).
+        const safePayload = stripSecretFromPayload(rawPayload);
+
+        // Step 2: Calculate SHA-256 event hash for early deduplication
+        const eventHash = buildEventHash(
+            safePayload.watch_uuid,
+            safePayload.change_datetime,
+            safePayload.diff_added
+        );
+        safePayload.event_hash = eventHash;
+
+        // Step 3: Early deduplication check via RawEvent model (L1 dedup)
+        const { isDuplicate, rawEvent } = await createRawEvent(safePayload);
+
+        if (isDuplicate) {
+            console.log(`🔁 [Webhook] Duplicate webhook ignored: hash=${eventHash}`);
+            return res.status(200).json({
+                success: true,
+                message: "Duplicate webhook ignored",
+                data: {
+                    status: "ignored_duplicate",
+                    event_hash: eventHash,
+                },
+            });
         }
-        );
 
-        const counts = await webhookQueue.getJobCounts(
-            "waiting",
-            "active",
-            "completed",
-            "failed"
-        );
+        // Step 4: Enqueue payload into BullMQ — include rawEventId so the worker
+        // can update the RawEvent status throughout the pipeline lifecycle
+        const jobPayload = {
+            ...safePayload,
+            rawEventId: rawEvent._id.toString(),
+        };
 
-        console.log(counts);
-        return res.status(200).json({
-            success: true,
-            message: "Webhook received",
-            // data: result
+        await webhookQueue.add("process-webhook", jobPayload, {
+            attempts: 3,
+            backoff: {
+                type: "exponential",
+                delay: 5000,
+            },
+            removeOnComplete: 100,
+            // removeOnFail: 500,
         });
 
+        // Mark RawEvent as queued now that the job is in BullMQ
+        await updateRawEventStatus(rawEvent._id, PIPELINE_STATUS.MATCHING, {
+            status_note: "Webhook queued for AI processing",
+        });
 
+        console.log(`📥 [Webhook] Queued for Watch: ${safePayload.watch_title || safePayload.watch_uuid}`);
+
+        // Step 5: Instant HTTP 200 OK Response (<100ms)
+        return res.status(200).json({
+            success: true,
+            message: "Webhook received and queued successfully",
+            data: {
+                raw_event_id: rawEvent._id,
+                status: "queued",
+                event_hash: eventHash,
+            },
+        });
     } catch (err) {
+        console.error("❌ [Webhook Controller] receiveChange failed:", err.message);
         return res.status(500).json({
-            status: false,
-            message: err.message
-        })
+            success: false,
+            message: `Webhook processing error: ${err.message}`,
+        });
     }
-}
+};
 
 const getLetestNotifications = async (req, res, next) => {
     try {
@@ -68,36 +125,15 @@ const getLetestNotifications = async (req, res, next) => {
 
         if (search) {
             filter.$or = [
-                {
-                    title: {
-                        $regex: search,
-                        $options: "i",
-                    },
-                },
-                {
-                    summary: {
-                        $regex: search,
-                        $options: "i",
-                    },
-                },
-                {
-                    department: {
-                        $regex: search,
-                        $options: "i",
-                    },
-                },
-                {
-                    body: {
-                        $regex: search,
-                        $options: "i",
-                    },
-                },
+                { title: { $regex: search, $options: "i" } },
+                { summary: { $regex: search, $options: "i" } },
+                { department: { $regex: search, $options: "i" } },
+                { body: { $regex: search, $options: "i" } },
             ];
         }
 
         const [total, notifications] = await Promise.all([
             LatestNotification.countDocuments(filter),
-
             LatestNotification.find(filter)
                 .select({
                     title: 1,
@@ -115,10 +151,7 @@ const getLetestNotifications = async (req, res, next) => {
                     createdAt: 1,
                     updatedAt: 1,
                 })
-                .sort({
-                    createdAt: -1,
-                    _id: -1,
-                })
+                .sort({ createdAt: -1, _id: -1 })
                 .skip(skip)
                 .limit(limit)
                 .lean()
@@ -191,28 +224,20 @@ export const getLetestNotificationBySlug = async (req, res, next) => {
         next(err);
     }
 };
+
 const letestNotificationSitemap = async (req, res, next) => {
     try {
-        console.log('0---')
         const page = Math.max(Number(req.query.page) || 1, 1);
         const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
 
         const skip = (page - 1) * limit;
 
-        const filter = {
-            // publish: true,
-        };
+        const filter = {};
 
         const [data, totalRecords] = await Promise.all([
             LatestNotification.find(filter)
-                .select({
-                    slug: 1,
-                    category: 1,
-                    updatedAt: 1,
-                })
-                .sort({
-                    _id: 1,
-                })
+                .select({ slug: 1, category: 1, updatedAt: 1 })
+                .sort({ _id: 1 })
                 .skip(skip)
                 .limit(limit)
                 .lean(),
@@ -236,9 +261,10 @@ const letestNotificationSitemap = async (req, res, next) => {
         next(error);
     }
 };
+
 export default {
     receiveChange,
     getLetestNotifications,
     getLetestNotificationBySlug,
-    letestNotificationSitemap
-}
+    letestNotificationSitemap,
+};

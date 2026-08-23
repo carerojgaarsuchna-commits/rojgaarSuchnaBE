@@ -1,4 +1,5 @@
-import { openRouterAPI } from "./ai-api/openRouterAPI.js";
+import { callTextLlm, getTextModel } from "./ai-api/aiProvider.js";
+
 const AIPROMPT = `
 
 You are an expert SEO content writer for "Rojgaar Suchna", India's top portal for sarkari naukri alerts, admit cards, and exam results.
@@ -71,24 +72,27 @@ Urgent CTA + official links
 Input Article: [PASTE_FULL_ARTICLE_HERE]
 
 `
+
+/**
+ * Generate a full SEO blog article in Markdown using the configured AI provider.
+ * Routes through aiProvider.js so AI_PROVIDER env variable is respected.
+ * Returns the raw markdown string.
+ */
 export async function createAIBlog(blogTxt) {
     try {
-        if (!blogTxt?.trim() || !AIPROMPT.trim()) {
-
-            console.error('no blog data found');
-            return
+        if (!blogTxt?.trim()) {
+            console.error("[createAIBlog] No blog text provided — skipping.");
+            return "";
         }
-        const AIPromptWithBlogTxt = AIPROMPT + " " + blogTxt
-        const aiAPIResponse = await openRouterAPI(AIPromptWithBlogTxt);
-        return aiAPIResponse
+
+        const prompt = AIPROMPT + " " + blogTxt;
+        const model = getTextModel();
+        const result = await callTextLlm(prompt, model);
+
+        // callTextLlm returns { raw, latencyMs }
+        return result?.raw || "";
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(`AI blog generation failed: ${message}`);
-
     }
-
 }
-
-
-
-
