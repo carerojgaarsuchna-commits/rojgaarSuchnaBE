@@ -1,5 +1,6 @@
 import express from "express";
 import homeRoutes from "./homeRoutes.js";
+import { getAIHomeData } from "../controllers/homeController.js";
 import answerKeyRoutes from "./answerKeyRoutes.js";
 import documentRoutes from "./documentRoutes.js";
 import admitCardRoutes from "./admitCardRoutes.js";
@@ -15,6 +16,7 @@ import pipelineRoutes from "./pipeline.routes.js"
 const router = express.Router();
 
 router.use("/home", homeRoutes);
+router.get("/ai-home", getAIHomeData);
 router.use("/answer-keys", answerKeyRoutes);
 router.use("/documents", documentRoutes);
 router.use("/admit-cards", admitCardRoutes);
@@ -31,3 +33,4 @@ router.use("/webhook",webhookRoutes)
 router.use("/pipeline", pipelineRoutes)
 
 export default router;
+

@@ -140,6 +140,8 @@ const getLetestNotifications = async (req, res, next) => {
                     original_title: 1,
                     slug: 1,
                     summary: 1,
+                    markdown_body: 1,
+                    pdf_url: 1,
                     body: 1,
                     department: 1,
                     category: 1,
@@ -183,7 +185,7 @@ export const getLetestNotificationBySlug = async (req, res, next) => {
         const { slug } = req.params;
 
         const job = await LatestNotification.findOne({ slug }).select(
-            "title original_title slug summary category notification_type notification_date department body source_url views ai_response createdAt updatedAt"
+            "title original_title pdf_url slug summary markdown_body category notification_type notification_date department body source_url views ai_response createdAt updatedAt"
         ).lean();;
 
         if (!job) {
