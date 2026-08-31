@@ -106,14 +106,14 @@ const getLetestNotifications = async (req, res, next) => {
             body,
             department,
             search,
-            status = "pending_review",
+            // status = "pending_review",
             publish,
             notification_type,
         } = req.query;
 
         const filter = {};
 
-        if (status) filter.status = status;
+        // if (status) filter.status = status;
         if (category) filter.category = category;
         if (body) filter.body = body;
         if (department) filter.department = department;
@@ -150,6 +150,7 @@ const getLetestNotifications = async (req, res, next) => {
                     source_url: 1,
                     publish: 1,
                     status: 1,
+                    new_or_updated: 1,
                     createdAt: 1,
                     updatedAt: 1,
                 })
@@ -185,7 +186,7 @@ export const getLetestNotificationBySlug = async (req, res, next) => {
         const { slug } = req.params;
 
         const job = await LatestNotification.findOne({ slug }).select(
-            "title original_title pdf_url slug summary markdown_body category notification_type notification_date department body source_url views ai_response createdAt updatedAt"
+            "title original_title pdf_url slug summary markdown_body category notification_type new_or_updated notification_date department body source_url views ai_response createdAt updatedAt"
         ).lean();;
 
         if (!job) {
