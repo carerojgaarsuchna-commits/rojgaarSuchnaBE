@@ -156,10 +156,9 @@ const getLetestNotifications = async (req, res, next) => {
                     createdAt: 1,
                     updatedAt: 1,
                 })
-                .sort({ createdAt: -1, _id: -1 })
+                .sort({ createdAt: -1 })
                 .skip(skip)
                 .limit(limit)
-                .allowDiskUse(true)
                 .lean()
                 .exec(),
         ]);
