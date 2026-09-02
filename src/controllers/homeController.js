@@ -182,10 +182,9 @@ export const getAIHomeData = async (req, res, next) => {
           // publish: { $ne: false },
         })
           .select("_id title slug markdown_body status publish createdAt notification_date")
-          .sort({ createdAt: -1, _id: -1 })
+          .sort({ createdAt: -1 })
           .limit(sectionLimit)
           .lean();
-        console.log(notifications, '--notifications---')
         const jobs = (notifications || []).map((doc) => ({
           refId: String(doc._id),
           refModel: "LatestNotification",
