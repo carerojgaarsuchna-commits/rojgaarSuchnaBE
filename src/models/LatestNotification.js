@@ -212,6 +212,11 @@ LatestNotificationSchema.index({
 });
 
 LatestNotificationSchema.index({
+    new_or_updated: 1,
+    createdAt: -1,
+});
+
+LatestNotificationSchema.index({
     title: "text",
     summary: "text",
     department: "text",

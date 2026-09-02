@@ -109,6 +109,7 @@ const getLetestNotifications = async (req, res, next) => {
             // status = "pending_review",
             publish,
             notification_type,
+            new_or_updated,
         } = req.query;
 
         const filter = {};
@@ -118,6 +119,7 @@ const getLetestNotifications = async (req, res, next) => {
         if (body) filter.body = body;
         if (department) filter.department = department;
         if (notification_type) filter.notification_type = notification_type;
+        if (new_or_updated) filter.new_or_updated = new_or_updated;
 
         if (publish !== undefined) {
             filter.publish = publish === "true";
@@ -157,6 +159,7 @@ const getLetestNotifications = async (req, res, next) => {
                 .sort({ createdAt: -1, _id: -1 })
                 .skip(skip)
                 .limit(limit)
+                .allowDiskUse(true)
                 .lean()
                 .exec(),
         ]);
